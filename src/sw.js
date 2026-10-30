@@ -10,7 +10,7 @@
 // v3-in-progress intermediate — history.md has the story); crash overlay +
 // in-app issue reporting (v6); guest streaming v2 (per-seat JPEG, guest
 // chrome hidden, coalesced audio).
-const CACHE = 'mgba-splitscreen-shell-v14';
+const CACHE = 'mgba-splitscreen-shell-v15';
 const SHELL = [
   './',
   './index.html',
@@ -54,8 +54,25 @@ self.addEventListener('fetch', (event) => {
   if (url.origin !== self.location.origin) return;
 
   // Navigation is network-first so a magic link never opens an obsolete shell.
+  // If the network is unavailable, serve the cached app shell WITHOUT the
+  // invite query string. A failed cache lookup must still return a Response;
+  // respondWith(undefined) is itself a FetchEvent network error.
   if (request.mode === 'navigate') {
-    event.respondWith(fetch(request).catch(() => caches.match('./index.html')));
+    event.respondWith((async () => {
+      try {
+        return await fetch(request);
+      } catch (error) {
+        console.warn('[sw] Navigation fetch failed; trying cached app shell:', error);
+        const cache = await caches.open(CACHE);
+        const shellUrl = new URL('./index.html', self.registration.scope).href;
+        const cachedShell = await cache.match(shellUrl);
+        if (cachedShell) return cachedShell;
+        return new Response(
+          'The app could not be reached and no offline copy is available. Check your internet connection and reload.',
+          { status: 503, statusText: 'App unavailable', headers: { 'Content-Type': 'text/plain; charset=utf-8' } },
+        );
+      }
+    })());
     return;
   }
 
@@ -66,6 +83,20 @@ self.addEventListener('fetch', (event) => {
   // Only cache the app shell. ROMs, save files, PeerJS, and WASM remain
   // network-controlled and are never silently persisted by this worker.
   if (SHELL.some((path) => new URL(path, self.location.href).pathname === url.pathname)) {
-    event.respondWith(caches.match(request).then((cached) => cached || fetch(request)));
+    event.respondWith((async () => {
+      const cache = await caches.open(CACHE);
+      const cached = await cache.match(request);
+      if (cached) return cached;
+      try {
+        return await fetch(request);
+      } catch (error) {
+        console.warn('[sw] App-shell asset fetch failed:', request.url, error);
+        return new Response('This app file could not be loaded. Check your connection and reload.', {
+          status: 503,
+          statusText: 'App file unavailable',
+          headers: { 'Content-Type': 'text/plain; charset=utf-8' },
+        });
+      }
+    })());
   }
 });
