@@ -1,9 +1,275 @@
-<!DOCTYPE html>
-<html>
-<head>
-    <meta http-equiv="refresh" content="0; url=./src/index.html" />
-</head>
-<body>
-    <p>Redirecting to emulator...</p>
-</body>
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="stylesheet" href="styles.css" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+    <meta name="theme-color" content="#121212" />
+    <meta name="mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <meta name="apple-mobile-web-app-title" content="mgba-splitscreen" />
+    <meta name="referrer" content="no-referrer" />
+    <link rel="manifest" href="manifest.json" />
+    <!-- PNG favicon + PNG app icons: Chrome's install check rejects SVG-only
+         manifest icons, and iOS homescreens need apple-touch-icon. -->
+    <link rel="icon" type="image/png" sizes="32x32" href="icon-32.png" />
+    <link rel="icon" href="icon.svg" type="image/svg+xml" sizes="any" />
+    <link rel="apple-touch-icon" href="apple-touch-icon.png" />
+    <title>mgba-splitscreen</title>
+    <!-- PeerJS is optional: local play and the WASM engine work if this CDN is unavailable. -->
+    <!-- qrcode MUST be 1.4.4: the build/ UMD bundle was dropped from 1.5.x,
+         and a 404 from the CDN gets ORB-blocked as a silent script failure
+         (the QR dialog then reports "generator unavailable"). -->
+    <script src="https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js" defer></script>
+    <script src="https://cdn.jsdelivr.net/npm/qrcode@1.4.4/build/qrcode.min.js" defer></script>
+    <!-- Crash reporter first: it must be listening before online.js/main.js run. -->
+    <script src="crash-report.js" defer></script>
+    <script src="touch-controls.js" defer></script>
+    <script src="online.js" defer></script>
+    <script type="module" src="main.js" defer></script>
+  </head>
+
+  <body>
+    <!-- Shown only when the in-browser WASM engine fails to start. Normally
+         this page runs fully client-side with no backend. -->
+    <div id="hosted-note" class="hosted-note" hidden>
+      <strong>mgba-splitscreen could not start its engine.</strong> The in-browser WebAssembly core failed to
+      load. Try reloading the page, or download the
+      <a href="https://github.com/Spuds0588/mgba-splitscreen/releases" target="_blank" rel="noreferrer">desktop app</a>.
+    </div>
+    <!-- Traditional top menu bar. Mouse-driven; game keys never navigate it. -->
+    <header class="menubar">
+      <span class="brand">mgba-splitscreen</span>
+
+      <details class="menu">
+        <summary>File</summary>
+        <div class="menu-items">
+          <button id="open-library">Games Library&#8230;</button>
+          <button id="load-rom">Load ROM&#8230;</button>
+          <button id="quit-game">Quit Game</button>
+          <button id="quick-save-state">Quick Save State</button>
+          <button id="quick-load-state">Quick Load State</button>
+          <button id="export-set">Export All Saves&#8230;</button>
+          <button id="import-set">Import All Saves&#8230;</button>
+          <button id="export-state">Export State Set&#8230;</button>
+          <button id="import-state">Import State Set&#8230;</button>
+        </div>
+      </details>
+
+      <details class="menu">
+        <summary>Saves</summary>
+        <div class="menu-items" id="save-menu"></div>
+      </details>
+
+      <!-- Choose how many linked GBA instances to run (1-4). Changing this
+           restarts emulation and reloads the current ROM at the new count. -->
+      <details class="menu">
+        <summary>Online<span class="beta-badge">beta</span></summary>
+        <div class="menu-items" id="online-menu">
+          <button id="online-host">Host Online Session</button>
+          <button id="online-host-pad">Host with Touch Controls</button>
+          <label class="online-slot-label" for="online-slot">Guest slot</label>
+          <select id="online-slot" disabled>
+            <option value="1">Player 2</option>
+          </select>
+          <button id="online-copy-invite" disabled>Copy Invite URL</button>
+          <button id="online-copy-all" disabled>Copy All Invite URLs</button>
+          <button id="online-show-qr" disabled>Show QR Code</button>
+          <button id="online-share" disabled>Share Invite&#8230;</button>
+          <div id="online-status" class="menu-note">BETA: play with up to 4 players total (host is Player 1; up to 3 guests). Before hosting, choose 2, 3, or 4 Players in the Players menu and load your ROM. Each guest gets a separate invite for their player slot and sees only their own game screen. Touch-control invites also enable the on-screen controller.</div>
+        </div>
+      </details>
+
+      <details class="menu">
+        <summary>Players</summary>
+        <div class="menu-items" id="player-menu">
+          <button data-players="1">1 Player</button>
+          <button data-players="2">2 Players</button>
+          <button data-players="3">3 Players</button>
+          <button data-players="4">4 Players</button>
+          <button id="toggle-solo" class="active">Solo Keyboard: On</button>
+          <div class="menu-note">Solo Keyboard drives only the active player with Player 1's controls; digits 1-4 switch which player is active (testing helper).</div>
+        </div>
+      </details>
+
+      <details class="menu">
+        <summary>Speed</summary>
+        <div class="menu-items">
+          <button id="toggle-turbo">Turbo</button>
+          <button id="toggle-pause">Pause</button>
+          <div class="menu-note">Turbo fast-forwards past the 60 fps pace; Pause freezes all players at once. Both are remappable (Controls &#8594; Remap Hotkeys).</div>
+        </div>
+      </details>
+
+      <details class="menu">
+        <summary>View</summary>
+        <div class="menu-items" id="view-menu">
+          <button data-view="grid" class="active">Grid</button>
+          <button data-view="speaker">Speaker (1 big + small)</button>
+          <button data-view="focus">Focus (single screen)</button>
+          <button data-view="overlay">Overlay (PiP)</button>
+          <button id="cycle-view">Cycle View (F8)</button>
+          <button id="cycle-focus">Focus: P1 (F9)</button>
+          <button id="toggle-ui-hide">Hide Menu / Full Screen: Off</button>
+          <button id="bg-image">Background Image&#8230;</button>
+          <button id="bg-clear">Clear Background</button>
+          <button id="toggle-outlines" class="active">Player Outlines: On</button>
+          <button id="toggle-touch">Touch Controls: Auto</button>
+          <button id="toggle-debug">Debug Log: Off</button>
+          <div class="menu-note">Arrange the linked screens like a video call. Cycle View (F8) and Cycle Focus (F9) flip through them; both are remappable. Hide Menu / Full Screen (F11) drops the chrome so the game fills the window. Background shows behind the tiles; Player Outlines toggles the colored borders; Debug Log toggles the stats ticker.</div>
+        </div>
+      </details>
+
+      <details class="menu">
+        <summary>Audio</summary>
+        <div class="menu-items" id="audio-menu">
+          <button data-audio="1" class="active">Player 1 (default)</button>
+          <button data-audio="2">Player 2</button>
+          <button data-audio="3">Player 3</button>
+          <button data-audio="4">Player 4</button>
+          <button data-audio="5">Mix all players</button>
+          <button data-audio="0">Mute</button>
+          <div class="menu-note">Each GBA instance outputs one mixed stream (music + SFX together). Pick whose mix you hear, or blend all players.</div>
+        </div>
+      </details>
+
+      <details class="menu">
+        <summary>Controls</summary>
+        <div class="menu-items" id="controls-menu">
+          <button data-remap="0">Player 1 Controls&#8230;</button>
+          <button data-remap="1">Player 2 Controls&#8230;</button>
+          <button data-remap="2">Player 3 Controls&#8230;</button>
+          <button data-remap="3">Player 4 Controls&#8230;</button>
+          <button id="remap-hotkeys">Remap Hotkeys&#8230;</button>
+          <div class="menu-note">Remap per-player GBA buttons and the global hotkeys (turbo / quick save / load / pause). Gamepads are assigned by controller slot (controller #1 &#8594; P1). Remaps persist in this browser.</div>
+        </div>
+      </details>
+
+      <details class="menu">
+        <summary>Help</summary>
+        <div class="menu-items">
+          <div class="menu-note">P1: WASD + K/J + L/H + Space/Backspace</div>
+          <div class="menu-note">P2: Arrows + M/N + V/B + Enter/O</div>
+          <div class="menu-note">P3: T/G/F/R + Y/U + Z/X + 1/2</div>
+          <div class="menu-note">P4: I/Q/C/E + P/[ + ,/. + 3/4</div>
+          <button id="report-issue-menu">Report an Issue&#8230;</button>
+          <div class="menu-note">Gamepads: slot #1&#8594;P1, #2&#8594;P2, etc. Face buttons, LB/RB, Select/Start, D-pad, and left stick. Remap via Controls menu.</div>
+          <div class="menu-note">Hotkeys: Turbo, Quick Save, Quick Load, Pause, Cycle View/Focus, and Hide Menu / Full Screen (F11) &#8212; remap them via Controls &#8594; Remap Hotkeys.</div>
+        </div>
+      </details>
+
+      <span id="status" class="status">Waiting for ROM&#8230;</span>
+      <span id="solo-badge" class="solo-badge"></span>
+    </header>
+
+    <!-- Full screen (Hide Menu) mode: the hotkey restores the chrome; this hint
+         fades in briefly so a fullscreen player is never truly lost. -->
+    <div id="ui-hidden-hint" class="ui-hidden-hint" hidden></div>
+
+    <!-- Screens fill the rest of the window; grid cells are laid out like a
+         video call (2/3/4 equal regions, letterboxed to the GBA 3:2 ratio). -->
+    <main id="screens" class="screen-container"></main>
+
+    <!-- Debug overlay: live per-second stats + mGBA WARN/ERROR lines streamed
+         from the backend over the WebSocket (text frames). -->
+    <div id="overlay" class="overlay"></div>
+
+    <!-- Control re-mapping overlay: per-player keyboard + gamepad bindings.
+         Navigate with the gamepad (D-pad moves, A selects, B closes) or click
+         a cell, then press the key/button you want; Esc/Done closes. -->
+    <div id="remap-overlay" class="remap-overlay" hidden>
+      <div class="remap-panel">
+        <h2 id="remap-title">Controls</h2>
+        <div class="remap-grid-head">
+          <span>GBA</span>
+          <span>Keyboard</span>
+          <span>Gamepad</span>
+        </div>
+        <div id="remap-rows" class="remap-rows"></div>
+        <div class="remap-actions">
+          <button id="remap-reset">Reset to defaults</button>
+          <button id="remap-done">Done</button>
+        </div>
+        <div id="remap-hint" class="remap-hint"></div>
+      </div>
+    </div>
+
+    <!-- Game library: a controller-navigable launcher for recently played games
+         and a folder of ROMs (with box art when a sibling image exists). -->
+    <div id="library-overlay" class="library-overlay" hidden>
+      <div class="library-panel">
+        <div class="library-header">
+          <h2>Games</h2>
+          <span id="library-hint" class="library-hint"></span>
+        </div>
+        <div id="library-grid" class="library-grid"></div>
+        <div class="library-actions">
+          <button id="library-add-folder">Add Folder&#8230;</button>
+          <button id="library-load-rom">Load ROM&#8230;</button>
+          <button id="library-close">Close</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- One-time online invite sharing surface. The QR contains the same
+         expiring invite URL as the copy/share actions. -->
+    <div id="online-qr-overlay" class="online-qr-overlay" hidden>
+      <div class="online-qr-panel">
+        <h2>Invite a player</h2>
+        <p class="online-qr-help">Scan this code or copy the invite URL. The invite expires after 10 minutes and works once.</p>
+        <canvas id="online-qr-canvas" width="320" height="320" aria-label="Online player invite QR code"></canvas>
+        <label class="online-url-label" for="online-invite-url">Invite URL</label>
+        <input id="online-invite-url" class="online-invite-url" type="text" readonly />
+        <div class="online-qr-actions">
+          <button id="online-qr-copy">Copy URL</button>
+          <button id="online-qr-download">Download QR</button>
+          <button id="online-qr-share">Share&#8230;</button>
+          <button id="online-qr-close">Close</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Touchscreen controls (phones/tablets, esp. magic-link guests):
+         GBA-style pad feeding the same key-mask pipeline as keyboard/gamepad.
+         Hidden by default; touch-controls.js decides visibility (auto/on/off). -->
+    <div id="touch-controls" class="touch-controls" hidden>
+      <div class="touch-top">
+        <button type="button" class="touch-btn touch-shoulder" data-btn="L" aria-label="L shoulder">L</button>
+        <div class="touch-top-center">
+          <button type="button" class="touch-btn touch-pause" data-action="pause" aria-label="Pause menu">&#8942;</button>
+          <button type="button" id="touch-edit" class="touch-edit-chip" data-action="edit" aria-label="Customize touch layout" aria-pressed="false">&#9998; Layout</button>
+          <div id="touch-note" class="touch-note"></div>
+          <div id="touch-player-picker" class="touch-player-picker"></div>
+        </div>
+        <button type="button" class="touch-btn touch-shoulder" data-btn="R" aria-label="R shoulder">R</button>
+      </div>
+      <div class="touch-main">
+        <div class="touch-dpad">
+          <button type="button" class="touch-btn dp-up" data-btn="UP" aria-label="Up">&#9650;</button>
+          <button type="button" class="touch-btn dp-left" data-btn="LEFT" aria-label="Left">&#9664;</button>
+          <div class="dp-center" aria-hidden="true"></div>
+          <button type="button" class="touch-btn dp-right" data-btn="RIGHT" aria-label="Right">&#9654;</button>
+          <button type="button" class="touch-btn dp-down" data-btn="DOWN" aria-label="Down">&#9660;</button>
+        </div>
+        <div class="touch-actions">
+          <button type="button" class="touch-btn face-b" data-btn="B" aria-label="B button">B</button>
+          <button type="button" class="touch-btn face-a" data-btn="A" aria-label="A button">A</button>
+        </div>
+      </div>
+      <div class="touch-center-row">
+        <button type="button" class="touch-btn touch-meta" data-btn="SELECT" aria-label="Select">SELECT</button>
+        <button type="button" class="touch-btn touch-meta" data-btn="START" aria-label="Start">START</button>
+      </div>
+    </div>
+
+    <!-- Pause menu: controller-navigable actions shown while emulation is paused. -->
+    <div id="pause-overlay" class="pause-overlay" hidden>
+      <div class="pause-panel">
+        <h2>Paused</h2>
+        <div id="pause-items" class="pause-items"></div>
+        <div id="pause-hint" class="remap-hint">D-pad to move &#183; A to select &#183; B to resume</div>
+      </div>
+    </div>
+  </body>
 </html>
