@@ -1,0 +1,3635 @@
+// Mobile builds (Android, and iOS if it ever happens) are Tauri apps that must
+// behave like the *web* build: they run the WebAssembly engine inside the system
+// WebView, and their Rust side deliberately exposes no commands at all (see the
+// `cfg(not(target_os = "android"))` gates in src-tauri/src/lib.rs). Folding that
+// into IS_TAURI is the whole mechanism — every `IS_TAURI ? desktopThing :
+// webThing` below then picks the web path on a tablet or TV, which is exactly
+// right for ROM picking, save-state export and the engine choice.
+//
+// The user-agent test is a heuristic, so `?engine=wasm|tauri` overrides it: a
+// misdetection would otherwise be unfixable without a rebuild, and on Android the
+// desktop path hangs retrying a WebSocket to 127.0.0.1:8088 that no process is
+// serving.
+const UA = typeof navigator !== 'undefined' ? navigator.userAgent || '' : '';
+const ENGINE_OVERRIDE = urlParam('engine');
+const IS_MOBILE = ENGINE_OVERRIDE
+  ? ENGINE_OVERRIDE !== 'tauri'
+  : /Android|iPhone|iPad|iPod/i.test(UA);
+const IS_TAURI = typeof window.__TAURI__ !== 'undefined' && !IS_MOBILE;
+// Tauri v2 exposes commands as window.__TAURI__.core.invoke; grab it once so the
+// keyboard path doesn't rely on an undefined bare `invoke`.
+const invoke = IS_TAURI ? window.__TAURI__.core.invoke : null;
+
+// ---- Session log ----
+// The in-browser WASM engine logs only to the devtools console; nothing ever
+// reaches disk, so a crashed/frozen session leaves no trace to inspect. Mirror
+// console output into a ring buffer and forward new lines to the server's
+// /session_log endpoint (appended to /tmp/mgba-splitscreen_session.log server-side) so
+// sessions can be reviewed after the fact. Best-effort: failures are silent.
+const sessionLog = [];
+const SESSION_LOG_MAX = 4000;
+let sessionLogSent = 0;
+let sessionLogTimer = null;
+
+function _sessionLogLine(level, args) {
+  let text;
+  try {
+    text = args.map(a => {
+      if (typeof a === 'string') return a;
+      try { return JSON.stringify(a); } catch (_) { return String(a); }
+    }).join(' ');
+  } catch (_) {
+    text = String(args[0]);
+  }
+  const line = '[' + new Date().toISOString().slice(11, 23) + '] ' + level + ' ' + text;
+  sessionLog.push(line);
+  if (sessionLog.length > SESSION_LOG_MAX) sessionLog.shift();
+}
+
+// Originals kept so internal diagnostics can still reach the devtools console
+// without being appended to the session buffer (and without recursing).
+const _origConsole = {};
+['log', 'warn', 'error'].forEach(lv => {
+  const orig = console[lv];
+  _origConsole[lv] = orig;
+  console[lv] = function (...args) {
+    try { orig.apply(console, args); } catch (_) {}
+    _sessionLogLine(lv, args);
+  };
+});
+
+// Set once the log endpoint is known to be missing, so a failed flush stops
+// re-POSTing and stops filling the console with 501s.
+let sessionLogBroken = false;
+
+function sessionLogFlush() {
+  if (!sessionLogBroken && sessionLogSent < sessionLog.length) {
+    const batch = sessionLog.slice(sessionLogSent);
+    sessionLogSent = sessionLog.length;
+    fetch('/session_log', { method: 'POST', body: batch.join('\n') + '\n' })
+      .then(res => {
+        if (!res.ok) {
+          // The backend ships with a /session_log POST handler; a plain static
+          // server (the documented Preview route) answers 501 to POST. Give up
+          // after the first refusal instead of retrying every 2 seconds.
+          sessionLogBroken = true;
+          _origConsole.warn('session log endpoint unavailable (' + res.status +
+            '); console capture disabled (emulation is unaffected)');
+        }
+      })
+      .catch(() => { /* offline/static: the next flush retries once */ });
+  }
+  // Re-arm unconditionally: the old code only re-armed when there was new
+  // data, so the first no-op flush killed the chain and everything logged
+  // after the initial batch sat in the buffer until unload (when fetch gets
+  // canceled by the browser) — sessions appeared to write nothing.
+  sessionLogTimer = setTimeout(sessionLogFlush, 2000);
+}
+
+// ---- Four Swords link assist switch ----------------------------------------
+//
+// The assist pokes Four Swords' private link state (IWRAM 0x03000FC3/0x03000FC8,
+// the EWRAM recv histories, the phase byte) every ~2 s while the games sit in
+// link-screen mode, and ships with a deadlock "kick" that re-injects a crafted
+// table. It has never moved the games off the "Linking with other systems…"
+// screen in any model (browser, cooperative native repro, threaded harness),
+// and sessions running with it show the emulated game fetching from unmapped
+// memory — the signature of a corrupted state machine. So it stays OFF unless
+// the page explicitly asks for it, which keeps A/B runs possible:
+//
+//   http://127.0.0.1:8090/?fsassist=1    (assist + kick on)
+//   http://127.0.0.1:8090/              (default: off, game state untouched)
+function fsAssistRequested() {
+  try {
+    return new URLSearchParams(window.location.search).get('fsassist') === '1';
+  } catch (_) {
+    return false;
+  }
+}
+
+function applyFsAssist() {
+  try {
+    if (wasmModule && wasmModule._mgs_set_fs_assist) {
+      wasmModule._mgs_set_fs_assist(fsAssistRequested() ? 1 : 0);
+    }
+    window.fsAssistActiveRef = fsAssistRequested();
+  } catch (_) { /* older builds without the export: nothing to switch */ }
+}
+
+// Every _mgs_init() re-creates the coordinator (and with it the assist flags), so
+// route the creations through here to keep the setting applied.
+function dbInit(count) {
+  wasmModule._mgs_init(count);
+  applyFsAssist();
+}
+
+// ---- Deep links (URL parameters) --------------------------------------------
+//
+// A static page can't go looking for ROMs, but a link can name one, so a shared
+// URL can drop everyone straight into the same session:
+//
+//   ?players=4                       linked players, 1-4 (applied before boot)
+//   ?rom=<url>                       fetch this .gba/.gb/.gbc/.gbx and start it immediately
+//   ?players=2&rom=roms/game.gba     combined; `rom` may be relative or absolute
+//
+// `rom` is fetched with fetch(), so a cross-origin URL only works when that host
+// sends permissive CORS headers; a relative path is same-origin and always works
+// (host the .gba beside index.html). Unknown parameters are ignored, so existing
+// links (?fsassist=1) keep working.
+function urlParam(name) {
+  try {
+    return new URLSearchParams(window.location.search).get(name);
+  } catch (_) {
+    return null;
+  }
+}
+
+function requestedPlayerCount() {
+  const raw = urlParam('players');
+  if (raw === null || raw === '') return null;
+  const n = parseInt(raw, 10);
+  if (!Number.isFinite(n) || n < 1 || n > 4) {
+    _origConsole.warn(`Ignoring ?players=${raw}: expected a count from 1 to 4`);
+    return null;
+  }
+  return n;
+}
+
+function requestedRomUrl() {
+  const raw = urlParam('rom');
+  if (!raw) return null;
+  try {
+    return new URL(raw, window.location.href).href;
+  } catch (_) {
+    _origConsole.warn(`Ignoring ?rom=${raw}: not a usable URL`);
+    return null;
+  }
+}
+
+// Fetch a ROM named by the URL and boot it into every linked core. Returns true
+// on success; failures are reported in the status line (and the launcher stays
+// usable, so a bad link degrades to "pick a ROM yourself").
+async function loadRomFromUrl(url) {
+  let stem = 'game';
+  try {
+    const base = decodeURIComponent(new URL(url).pathname.split('/').pop() || '');
+    if (base) stem = base.replace(/\.[^.]+$/, '') || base;
+  } catch (_) { /* keep the fallback name */ }
+
+  setStatus(`Fetching: ${stem}\u2026`);
+  let resp;
+  try {
+    resp = await fetch(url);
+  } catch (err) {
+    // fetch() only rejects on a network-level failure, which for a shared link
+    // is nearly always CORS rather than a missing file.
+    setStatus(`Could not fetch ROM: ${err.message} \u2014 the host must allow cross-origin reads (CORS)`);
+    return false;
+  }
+  if (!resp.ok) {
+    setStatus(`Could not fetch ROM: HTTP ${resp.status} ${resp.statusText || ''} \u2014 check the ?rom= path`.trim());
+    return false;
+  }
+  let bytes;
+  try {
+    bytes = new Uint8Array(await resp.arrayBuffer());
+  } catch (err) {
+    setStatus(`Could not read ROM: ${err.message}`);
+    return false;
+  }
+  if (bytes.length < 0xc0) {
+    setStatus(`Could not load ROM: ${stem} is too small to be a GBA image`);
+    return false;
+  }
+
+  setStatus(`Loading: ${stem}`);
+  const ok = wasmLoadRomBytes(bytes) === 0;
+  if (ok) {
+    resetRuntimeState();
+    // Cache it like a picked file so the launcher's Recent list can relaunch it
+    // without the network.
+    let key = null;
+    try {
+      key = `rom_${stem}`;
+      await cacheGameBytes(key, stem, bytes);
+    } catch (_) { key = null; }
+    recordRecent(stem, null, null, key);
+  }
+  setStatus(ok ? `Running: ${stem}` : 'Error: ROM load failed in browser engine');
+  // Per-game touch-control layouts follow the loaded ROM (see touch-controls.js).
+  if (ok) { try { window.mgbaTouch?.setRom?.(stem); } catch (_) {} }
+  return ok;
+}
+
+if (typeof window !== 'undefined') {
+  window.addEventListener('load', () => { sessionLogTimer = setTimeout(sessionLogFlush, 2000); });
+  window.addEventListener('beforeunload', () => {
+    if (sessionLogTimer) clearTimeout(sessionLogTimer);
+    if (!sessionLogBroken && sessionLogSent < sessionLog.length) {
+      const batch = sessionLog.slice(sessionLogSent);
+      // sendBeacon survives page teardown where fetch gets canceled.
+      try {
+        navigator.sendBeacon('/session_log', batch.join('\n') + '\n');
+      } catch (_) {
+        sessionLogFlush();
+      }
+    }
+  });
+}
+
+const GBA_WIDTH = 240;
+const GBA_HEIGHT = 160;
+// The socket backend still uses the proven fixed GBA wire format. The WASM
+// backend reports each core's actual dimensions (GB/GBC is normally 160x144),
+// so its renderer uses the per-screen metadata below. Desktop GB rendering will
+// follow the native instance refactor in the next v0.4 slice.
+const FRAME_SIZE = GBA_WIDTH * GBA_HEIGHT * 4;
+const ROM_EXTENSIONS = ['gba', 'gb', 'gbc', 'gbx'];
+function romAccept() { return '.' + ROM_EXTENSIONS.join(',.'); }
+function isRomName(name) { return /\.(gba|gb|gbc|gbx)$/i.test(name || ''); }
+
+const GBA_BUTTONS = {
+  A: 1 << 0,
+  B: 1 << 1,
+  SELECT: 1 << 2,
+  START: 1 << 3,
+  RIGHT: 1 << 4,
+  LEFT: 1 << 5,
+  UP: 1 << 6,
+  DOWN: 1 << 7,
+  R: 1 << 8,
+  L: 1 << 9,
+};
+
+const P1_MAP = {
+  'KeyW': GBA_BUTTONS.UP,
+  'KeyS': GBA_BUTTONS.DOWN,
+  'KeyA': GBA_BUTTONS.LEFT,
+  'KeyD': GBA_BUTTONS.RIGHT,
+  'KeyK': GBA_BUTTONS.A,
+  'KeyJ': GBA_BUTTONS.B,
+  'KeyL': GBA_BUTTONS.R,
+  'KeyH': GBA_BUTTONS.L,
+  'Space': GBA_BUTTONS.START,
+  'Backspace': GBA_BUTTONS.SELECT,
+};
+
+const P2_MAP = {
+  'ArrowUp': GBA_BUTTONS.UP,
+  'ArrowDown': GBA_BUTTONS.DOWN,
+  'ArrowLeft': GBA_BUTTONS.LEFT,
+  'ArrowRight': GBA_BUTTONS.RIGHT,
+  'KeyM': GBA_BUTTONS.A,
+  'KeyN': GBA_BUTTONS.B,
+  'KeyV': GBA_BUTTONS.L,
+  'KeyB': GBA_BUTTONS.R,
+  'Enter': GBA_BUTTONS.START,
+  'KeyO': GBA_BUTTONS.SELECT,
+};
+
+// P3/P4 maps: one keyboard, four players, no overlap with P1/P2 bindings.
+// P1 uses W/S/A/D + K/J/L/H; P2 uses arrows + M/N/V/B + Enter/O; P3/P4 use the
+// T/G/F/R + Y/U + digits and I/Q/C/E + P/brackets/comma/period clusters.
+const P3_MAP = {
+  'KeyT': GBA_BUTTONS.UP,
+  'KeyG': GBA_BUTTONS.DOWN,
+  'KeyF': GBA_BUTTONS.LEFT,
+  'KeyR': GBA_BUTTONS.RIGHT,
+  'KeyY': GBA_BUTTONS.A,
+  'KeyU': GBA_BUTTONS.B,
+  'KeyZ': GBA_BUTTONS.L,
+  'KeyX': GBA_BUTTONS.R,
+  'Digit1': GBA_BUTTONS.START,
+  'Digit2': GBA_BUTTONS.SELECT,
+};
+
+const P4_MAP = {
+  'KeyI': GBA_BUTTONS.UP,
+  'KeyQ': GBA_BUTTONS.DOWN,
+  'KeyC': GBA_BUTTONS.LEFT,
+  'KeyE': GBA_BUTTONS.RIGHT,
+  'KeyP': GBA_BUTTONS.A,
+  'BracketLeft': GBA_BUTTONS.B,
+  'Comma': GBA_BUTTONS.L,
+  'Period': GBA_BUTTONS.R,
+  'Digit3': GBA_BUTTONS.START,
+  'Digit4': GBA_BUTTONS.SELECT,
+};
+
+// ---- Controls (per-player, persisted to localStorage) ----
+// Keyboard defaults come from the P1-P4 maps above. Gamepads are assigned by
+// controller slot (controller #1 -> P1, #2 -> P2, ...) using the standard
+// mapping: face buttons, LB/RB, Select/Start, and the D-pad; the left stick
+// maps to movement through the axes (not remappable, kept as a bonus).
+const DEFAULT_KEYBOARD_MAPS = [P1_MAP, P2_MAP, P3_MAP, P4_MAP];
+
+const DEFAULT_GAMEPAD_BUTTONS = {
+  0: GBA_BUTTONS.A,
+  1: GBA_BUTTONS.B,
+  // L/R default to the shoulder controls: both bumpers (LB/RB) and analog
+  // triggers (LT/RT) map to L/R so the layout works on any controller. X/Y
+  // (buttons 2/3) are left unbound by default so they're free for remapping.
+  4: GBA_BUTTONS.L, // LB bumper -> L
+  5: GBA_BUTTONS.R, // RB bumper -> R
+  6: GBA_BUTTONS.L, // LT trigger -> L (alternate)
+  7: GBA_BUTTONS.R, // RT trigger -> R (alternate)
+  8: GBA_BUTTONS.SELECT,
+  9: GBA_BUTTONS.START,
+  12: GBA_BUTTONS.UP,
+  13: GBA_BUTTONS.DOWN,
+  14: GBA_BUTTONS.LEFT,
+  15: GBA_BUTTONS.RIGHT,
+};
+
+const DEFAULT_GAMEPAD_AXES = {
+  0: { neg: GBA_BUTTONS.LEFT, pos: GBA_BUTTONS.RIGHT }, // left stick X
+  1: { neg: GBA_BUTTONS.UP, pos: GBA_BUTTONS.DOWN }, // left stick Y (up = -1)
+};
+
+const CONTROLS_KEY = 'mgba-splitscreen_controls_v2'; // v2: L/R default to bumpers/triggers
+let controls = []; // 4 entries: { keyboard, gamepadButtons, gamepadAxes }
+
+function defaultControlFor(p) {
+  return {
+    keyboard: { ...DEFAULT_KEYBOARD_MAPS[p] },
+    gamepadButtons: { ...DEFAULT_GAMEPAD_BUTTONS },
+    gamepadAxes: { ...DEFAULT_GAMEPAD_AXES },
+  };
+}
+
+function loadControls() {
+  controls = [];
+  for (let p = 0; p < 4; p++) controls.push(defaultControlFor(p));
+  try {
+    const raw = localStorage.getItem(CONTROLS_KEY);
+    if (!raw) return;
+    const saved = JSON.parse(raw);
+    for (let p = 0; p < 4; p++) {
+      const s = saved[p];
+      if (!s) continue;
+      controls[p] = {
+        keyboard: { ...controls[p].keyboard, ...(s.keyboard || {}) },
+        gamepadButtons: { ...controls[p].gamepadButtons, ...(s.gamepadButtons || {}) },
+        gamepadAxes: { ...controls[p].gamepadAxes, ...(s.gamepadAxes || {}) },
+      };
+    }
+  } catch (e) {
+    // Corrupt storage: keep the defaults.
+  }
+}
+
+function saveControls() {
+  try {
+    localStorage.setItem(CONTROLS_KEY, JSON.stringify(controls));
+  } catch (e) {
+    // localStorage unavailable (private mode): remaps just won't persist.
+  }
+}
+
+// Pretty names + helpers for the remap UI.
+const REMAP_ACTIONS = [
+  { name: 'A', bit: GBA_BUTTONS.A },
+  { name: 'B', bit: GBA_BUTTONS.B },
+  { name: 'L', bit: GBA_BUTTONS.L },
+  { name: 'R', bit: GBA_BUTTONS.R },
+  { name: 'START', bit: GBA_BUTTONS.START },
+  { name: 'SELECT', bit: GBA_BUTTONS.SELECT },
+  { name: 'UP', bit: GBA_BUTTONS.UP },
+  { name: 'DOWN', bit: GBA_BUTTONS.DOWN },
+  { name: 'LEFT', bit: GBA_BUTTONS.LEFT },
+  { name: 'RIGHT', bit: GBA_BUTTONS.RIGHT },
+];
+
+const PAD_BUTTON_NAMES = ['A', 'B', 'X', 'Y', 'LB', 'RB', 'LT', 'RT', 'Select', 'Start', 'L3', 'R3', 'D-Up', 'D-Down', 'D-Left', 'D-Right'];
+
+function formatKeyCode(code) {
+  if (code.startsWith('Key')) return code.slice(3);
+  if (code.startsWith('Digit')) return code.slice(5);
+  const names = {
+    ArrowUp: '\u2191', ArrowDown: '\u2193', ArrowLeft: '\u2190', ArrowRight: '\u2192',
+    Space: 'Space', Enter: 'Enter', Backspace: 'Bksp',
+    Comma: ',', Period: '.', BracketLeft: '[', BracketRight: ']',
+  };
+  return names[code] || code;
+}
+
+function formatPadButton(idx) {
+  return PAD_BUTTON_NAMES[idx] ? `${PAD_BUTTON_NAMES[idx]} (${idx})` : `Btn ${idx}`;
+}
+
+function keyForBit(map, bit) {
+  for (const code in map) if (map[code] === bit) return formatKeyCode(code);
+  return null;
+}
+
+function padButtonForBit(map, bit) {
+  for (const idx in map) if (map[idx] === bit) return formatPadButton(parseInt(idx, 10));
+  return null;
+}
+
+// ---- Global hotkeys (turbo / quick save / quick load / pause) ----
+// Global (not per-player) system actions. Keyboard keys plus optional gamepad
+// buttons, persisted independently of the per-player control maps.
+const HOTKEYS_KEY = 'mgba-splitscreen_hotkeys_v1';
+
+const HOTKEY_ACTIONS = [
+  { id: 'turbo', label: 'Turbo' },
+  { id: 'save', label: 'Quick Save State' },
+  { id: 'load', label: 'Quick Load State' },
+  { id: 'pause', label: 'Pause' },
+  { id: 'cycle_view', label: 'Cycle View Mode' },
+  { id: 'cycle_focus', label: 'Cycle Focus Player' },
+  { id: 'ui_hide', label: 'Hide Menu / Full Screen' },
+];
+
+function defaultHotkeys() {
+  return {
+    turbo: { keyboard: 'Tab', gamepad: null },
+    save: { keyboard: 'F5', gamepad: null },
+    load: { keyboard: 'F7', gamepad: null },
+    pause: { keyboard: 'Escape', gamepad: null },
+    cycle_view: { keyboard: 'F8', gamepad: null },
+    cycle_focus: { keyboard: 'F9', gamepad: null },
+    ui_hide: { keyboard: 'F11', gamepad: null },
+  };
+}
+
+let hotkeys = defaultHotkeys();
+
+function loadHotkeys() {
+  hotkeys = defaultHotkeys();
+  try {
+    const raw = localStorage.getItem(HOTKEYS_KEY);
+    if (!raw) return;
+    const saved = JSON.parse(raw);
+    for (const k in hotkeys) {
+      if (saved[k] && typeof saved[k] === 'object') {
+        hotkeys[k] = { ...hotkeys[k], ...saved[k] };
+      }
+    }
+  } catch (e) {
+    // Corrupt storage: keep the defaults.
+  }
+}
+
+function saveHotkeys() {
+  try {
+    localStorage.setItem(HOTKEYS_KEY, JSON.stringify(hotkeys));
+  } catch (e) {
+    // localStorage unavailable (private mode): remaps just won't persist.
+  }
+  refreshHotkeyLabels();
+  refreshFocusLabel();
+}
+
+// Pretty name(s) for a hotkey's current binding(s).
+function hotkeyLabel(id) {
+  const hk = hotkeys[id];
+  const parts = [];
+  if (hk.keyboard) parts.push(formatKeyCode(hk.keyboard));
+  if (hk.gamepad !== null && hk.gamepad !== undefined) parts.push(formatPadButton(hk.gamepad));
+  return parts.length ? parts.join(' / ') : 'unbound';
+}
+
+// Keep the menu buttons' "(F5)"-style hints in sync with the live bindings.
+function refreshHotkeyLabels() {
+  const map = {
+    turbo: '#toggle-turbo',
+    save: '#quick-save-state',
+    load: '#quick-load-state',
+    pause: '#toggle-pause',
+    cycle_view: '#cycle-view',
+    ui_hide: '#toggle-ui-hide',
+  };
+  for (const id in map) {
+    const el = document.querySelector(map[id]);
+    if (!el) continue;
+    const action = HOTKEY_ACTIONS.find((a) => a.id === id);
+    el.textContent = `${action.label} (${hotkeyLabel(id)})`;
+  }
+}
+
+// Player color coding (like name borders on a video call): P1 red, P2 blue,
+// P3 green, P4 orange. Same palette for the border and the bottom-right tag.
+const PLAYER_TAGS = ['player-1', 'player-2', 'player-3', 'player-4'];
+
+const OVERLAY_MAX = 6;
+let playerCount = 2;
+let screens = []; // { canvas, ctx, imgData }
+let keyStates = []; // keyboard-derived mask per player
+
+// ---- Solo keyboard mode (testing helper) ----
+// One keyboard drives the ACTIVE player using Player 1's control map; digits
+// 1-4 switch which player is active. Lets a single tester drive all players
+// without juggling four control schemes (default on; persisted).
+const SOLO_KEY = 'mgba-splitscreen_solo_v1';
+let soloKeyboard = true;
+let soloPlayer = 0; // 0-based active player index
+
+function loadSolo() {
+  try {
+    const raw = localStorage.getItem(SOLO_KEY);
+    if (raw !== null) soloKeyboard = raw === '1';
+  } catch (e) {}
+  soloPlayer = Math.min(soloPlayer, Math.max(0, playerCount - 1));
+  updateSoloUI();
+}
+
+function saveSolo() {
+  try { localStorage.setItem(SOLO_KEY, soloKeyboard ? '1' : '0'); } catch (e) {}
+}
+
+function updateSoloUI() {
+  const btn = document.getElementById('toggle-solo');
+  if (btn) {
+    btn.textContent = soloKeyboard ? 'Solo Keyboard: On' : 'Solo Keyboard: Off';
+    btn.classList.toggle('active', soloKeyboard);
+  }
+  const badge = document.getElementById('solo-badge');
+  if (badge) badge.textContent = soloKeyboard ? `Active: P${soloPlayer + 1}` : '';
+}
+
+function releaseAllKeys() {
+  for (let i = 0; i < keyStates.length; i++) {
+    if (keyStates[i]) { keyStates[i] = 0; sendKeys(i); }
+  }
+  // The touch overlay holds its own masks; clear them too so nothing sticks.
+  if (window.mgbaTouch) window.mgbaTouch.releaseAll();
+}
+
+function setSoloPlayer(p) {
+  if (p < 0 || p >= playerCount || p === soloPlayer) return;
+  releaseAllKeys(); // don't let a held button stick on the old player
+  soloPlayer = p;
+  updateSoloUI();
+}
+
+function toggleSoloKeyboard() {
+  soloKeyboard = !soloKeyboard;
+  saveSolo();
+  releaseAllKeys();
+  soloPlayer = Math.min(soloPlayer, Math.max(0, playerCount - 1));
+  setStatus(soloKeyboard
+    ? `Solo keyboard on — digits 1-${playerCount} switch active player`
+    : 'Solo keyboard off');
+  updateSoloUI();
+}
+let padStates = []; // gamepad-derived mask per player
+// Touchscreen overlay (touch-controls.js) mask per player. Merged in sendKeys
+// like the other input layers; a magic-link guest on a phone plays through it.
+function touchStateFor(p) {
+  return (window.mgbaTouch && window.mgbaTouch.maskFor(p)) || 0;
+}
+let socket = null;
+let turboOn = false;
+let paused = false;
+let debugOn = false; // Debug overlay is off by default (View menu toggles it).
+// View layout: 'grid' | 'speaker' (1 big + smalls) | 'focus' (single screen) |
+// 'overlay' (one tile floating enlarged on top of the grid). focusPlayer selects
+// which player's screen is enlarged/shown in speaker/focus/overlay modes.
+let viewMode = 'grid';
+let focusPlayer = 0;
+
+// ---- In-browser engine (fully client-side, no backend) ----
+// The mGBA core compiled to WebAssembly runs right here in the page: all N
+// linked instances step cooperatively on the JS thread through the same
+// lockstep coordinator the desktop app uses. Every backend call below branches
+// on `wasmMode` (browser builds always use it; the desktop never does).
+let wasmMode = false;
+let wasmModule = null;     // emscripten module (Module["_mgs_*"] + HEAPU8)
+let wasmStates = [];       // per-player quick-save blobs (Uint8Array)
+let wasmLoopId = 0;        // requestAnimationFrame id
+let wasmLast = 0;          // last rAF timestamp
+let wasmAccum = 0;         // fixed-timestep accumulator (ms) for 60fps pacing
+const FRAME_MS = 1000 / 60;
+
+function setStatus(text) {
+  // Feed the crash reporter the currently running game (every successful ROM
+  // load reports itself as "Running: <name>", so this catches all load paths).
+  if (typeof text === 'string' && text.startsWith('Running: ')) {
+    try { window.lastRunningRom = text.slice('Running: '.length); } catch (_) {}
+  }
+  document.getElementById('status').textContent = text;
+  // Mobile guests get a controller, not an admin console: every menu in the
+  // bar is a host-only power (ROM loading, invites, saves, remap). online.js
+  // reports "Online guest: …" on join/welcome — that string is our signal to
+  // strip the chrome (CSS: body.guest-session). Status text stays for bugs.
+  document.body.classList.toggle('guest-session',
+    typeof text === 'string' && text.startsWith('Online guest:'));
+}
+
+let currentOnlineInvite = null;
+let currentOnlineSlot = 1;
+let currentOnlineInvites = {};
+
+function setOnlineStatus(text) {
+  const el = document.getElementById('online-status');
+  if (el) el.textContent = text;
+}
+
+function setOnlineInviteControls(enabled) {
+  for (const id of ['online-copy-invite', 'online-copy-all', 'online-show-qr', 'online-share']) {
+    const button = document.getElementById(id);
+    if (button) button.disabled = !enabled;
+  }
+  const slot = document.getElementById('online-slot');
+  if (slot) slot.disabled = !enabled;
+}
+
+function updateOnlineInvites(descriptors) {
+  currentOnlineInvites = {};
+  for (const invite of descriptors || []) {
+    if (invite.url && !invite.consumed) currentOnlineInvites[invite.player] = invite.url;
+  }
+  const slots = Object.keys(currentOnlineInvites).map(Number).sort((a, b) => a - b);
+  const select = document.getElementById('online-slot');
+  if (select) {
+    select.innerHTML = '';
+    for (const player of slots) {
+      const option = document.createElement('option');
+      option.value = String(player);
+      option.textContent = `Player ${player + 1}`;
+      select.appendChild(option);
+    }
+    if (slots.includes(currentOnlineSlot)) select.value = String(currentOnlineSlot);
+    else currentOnlineSlot = slots[0] || 1;
+  }
+  currentOnlineInvite = currentOnlineInvites[currentOnlineSlot] || null;
+  setOnlineInviteControls(slots.length > 0);
+  if (currentOnlineInvite) renderOnlineQr(currentOnlineInvite);
+}
+
+function selectOnlineSlot(player) {
+  currentOnlineSlot = Number(player);
+  currentOnlineInvite = currentOnlineInvites[currentOnlineSlot] || null;
+  if (currentOnlineInvite) renderOnlineQr(currentOnlineInvite);
+}
+
+async function copyAllOnlineInvites() {
+  const text = Object.keys(currentOnlineInvites).sort((a, b) => Number(a) - Number(b))
+    .map((player) => `Player ${Number(player) + 1}: ${currentOnlineInvites[player]}`)
+    .join('\\n');
+  if (!text) return;
+  try {
+    await navigator.clipboard.writeText(text);
+    setOnlineStatus('All remaining guest invite URLs copied.');
+  } catch (_) {
+    window.prompt('Copy the guest invite URLs:', text);
+  }
+}
+
+function renderOnlineQr(invite) {
+  const canvas = document.getElementById('online-qr-canvas');
+  const input = document.getElementById('online-invite-url');
+  if (input) input.value = invite || '';
+  if (!canvas || !invite) return false;
+  if (!window.QRCode?.toCanvas) {
+    setOnlineStatus('QR generator unavailable; copy the invite URL instead.');
+    return false;
+  }
+  window.QRCode.toCanvas(canvas, invite, {
+    width: 320,
+    margin: 2,
+    errorCorrectionLevel: 'M',
+    color: { dark: '#111111', light: '#ffffff' },
+  }, (error) => {
+    if (error) setOnlineStatus('Could not generate QR code; copy the invite URL instead.');
+  });
+  return true;
+}
+
+function openOnlineQr(invite = currentOnlineInvite) {
+  if (!invite) return;
+  currentOnlineInvite = invite;
+  renderOnlineQr(invite);
+  document.getElementById('online-qr-overlay').hidden = false;
+}
+
+function closeOnlineQr() {
+  document.getElementById('online-qr-overlay').hidden = true;
+}
+
+async function shareOnlineInvite() {
+  if (!currentOnlineInvite) return;
+  if (navigator.share) {
+    try {
+      await navigator.share({
+        title: 'Join my mgba-splitscreen game',
+        text: 'Join my multiplayer game with this invite:',
+        url: currentOnlineInvite,
+      });
+      setOnlineStatus('Invite shared.');
+      return;
+    } catch (error) {
+      if (error?.name === 'AbortError') return;
+    }
+  }
+  await copyOnlineInvite();
+  setOnlineStatus('Invite sharing is unavailable; the URL was copied instead.');
+}
+
+async function downloadOnlineQr() {
+  const canvas = document.getElementById('online-qr-canvas');
+  if (!canvas || !currentOnlineInvite) return;
+  const blob = await new Promise((resolve) => canvas.toBlob(resolve, 'image/png'));
+  if (!blob) return;
+  const link = document.createElement('a');
+  link.href = URL.createObjectURL(blob);
+  link.download = 'mgba-splitscreen-invite.png';
+  link.click();
+  setTimeout(() => URL.revokeObjectURL(link.href), 1000);
+  setOnlineStatus('QR code downloaded.');
+}
+
+function onlineJoinRequested() {
+  // The bearer token lives in the URL fragment so it is not sent in referrers.
+  return urlParam('online') === 'join' && !!urlParam('peer');
+}
+
+async function startOnlineHost(padOnly) {
+  if (!window.mgbaOnline) {
+    setOnlineStatus('PeerJS is unavailable; check the network or Content-Security-Policy.');
+    return;
+  }
+  const invite = await window.mgbaOnline.startHost(padOnly);
+  if (!invite) return;
+  // The online layer publishes the complete per-slot set through its callback;
+  // this fallback keeps P2 usable if an older online.js is cached.
+  if (!currentOnlineInvites[1]) currentOnlineInvites[1] = invite;
+  currentOnlineInvite = currentOnlineInvites[currentOnlineSlot] || invite;
+  setOnlineInviteControls(Object.keys(currentOnlineInvites).length > 0);
+  const button = document.getElementById('online-copy-invite');
+  if (button) button.dataset.invite = currentOnlineInvite;
+  renderOnlineQr(currentOnlineInvite);
+  try {
+    await navigator.clipboard.writeText(invite);
+    setOnlineStatus('Host ready — invite copied to the clipboard.');
+  } catch (_) {
+    setOnlineStatus('Host ready — use Copy Invite URL or Show QR Code.');
+  }
+  openOnlineQr(invite);
+}
+
+async function copyOnlineInvite() {
+  const invite = currentOnlineInvite || document.getElementById('online-copy-invite')?.dataset.invite;
+  if (!invite) return;
+  try {
+    await navigator.clipboard.writeText(invite);
+    setOnlineStatus('Guest invite copied.');
+  } catch (_) {
+    window.prompt('Copy this guest invite:', invite);
+  }
+}
+
+// ---- Menu bar ----
+
+function closeMenus() {
+  document.querySelectorAll('.menu[open]').forEach((m) => m.removeAttribute('open'));
+  if (document.activeElement && document.activeElement.blur) document.activeElement.blur();
+}
+
+function menuOpen() {
+  return !!document.querySelector('.menu[open]');
+}
+
+// Close any open menu on an outside click; the per-action handlers below call
+// closeMenus() themselves and blur, so keyboard focus never lingers on a menu
+// button and steals Enter/Space from the emulator.
+document.addEventListener('click', (e) => {
+  if (!e.target.closest('.menu')) closeMenus();
+});
+
+// Only one menu open at a time: opening one closes its siblings (mouse or
+// keyboard). Fixes the overlap bug where clicking a second menu without
+// dismissing the first left both open.
+document.querySelectorAll('.menu').forEach((m) => {
+  m.addEventListener('toggle', () => {
+    if (!m.open) return;
+    document.querySelectorAll('.menu[open]').forEach((other) => {
+      if (other !== m) other.removeAttribute('open');
+    });
+  });
+});
+
+// ---- Turbo / fast-forward ----
+
+function highlightTurbo(on) {
+  const btn = document.getElementById('toggle-turbo');
+  if (btn) btn.classList.toggle('active', on);
+}
+
+async function toggleTurbo() {
+  turboOn = !turboOn;
+  if (wasmMode) {
+    // The frame loop honors the flag; flush buffered audio so fast-forwarded
+    // sound doesn't burst out when turbo is released.
+    if (!turboOn) wasmFlushAudio();
+  } else if (IS_TAURI) {
+    await invoke('set_turbo', { enabled: turboOn });
+  } else if (socket && socket.readyState === WebSocket.OPEN) {
+    socket.send(JSON.stringify({ type: 'turbo', enabled: turboOn }));
+  }
+  highlightTurbo(turboOn);
+  setStatus(turboOn ? `TURBO ON — fast-forwarding (${hotkeyLabel('turbo')})` : `Turbo off (${hotkeyLabel('turbo')})`);
+}
+
+// ---- Pause (all players together) ----
+
+function highlightPause(on) {
+  const btn = document.getElementById('toggle-pause');
+  if (btn) btn.classList.toggle('active', on);
+}
+
+async function togglePause() {
+  paused = !paused;
+  if (wasmMode) {
+    // The frame loop freezes all cores while paused; nothing to send.
+  } else if (IS_TAURI) {
+    await invoke('set_paused', { paused });
+  } else if (socket && socket.readyState === WebSocket.OPEN) {
+    socket.send(JSON.stringify({ type: 'pause', paused }));
+  }
+  highlightPause(paused);
+  if (paused) openPauseMenu();
+  else closePauseMenu();
+  setStatus(paused ? `PAUSED — all players frozen (${hotkeyLabel('pause')})` : 'Resumed');
+}
+
+// Dispatch a global hotkey id (shared by the keyboard and gamepad paths).
+function triggerHotkey(id) {
+  if (id === 'turbo') toggleTurbo();
+  else if (id === 'save') quickSaveState();
+  else if (id === 'load') quickLoadState();
+  else if (id === 'pause') togglePause();
+  else if (id === 'cycle_view') cycleViewMode();
+  else if (id === 'cycle_focus') cycleFocusPlayer();
+  else if (id === 'ui_hide') toggleUiHide();
+}
+
+// The backend recreates the emulator (and resets turbo/pause to off) on
+// quit-game and player-count changes; keep the frontend flags in lockstep.
+function resetRuntimeState() {
+  turboOn = false;
+  highlightTurbo(false);
+  paused = false;
+  highlightPause(false);
+  if (pauseOpen()) closePauseMenu();
+}
+
+// ---- Full screen / hide menu (F11, remappable as "ui_hide") ----
+// Hides the menu bar + overlays so the game fills the window; with the real
+// Fullscreen API available (desktop/web browsers) it also requests the
+// document-wide fullscreen so nothing outside the game is visible. F11 (or the
+// bound key) toggles it back. Kept out of resetRuntimeState: hiding the chrome
+// is a UI preference, not emulation state, and should survive pause/quit.
+const UI_HIDE_KEY = 'mgba-splitscreen_uihide_v1';
+let uiHidden = false;
+let browserFullscreen = false;
+
+function loadUiHide() {
+  try {
+    const raw = localStorage.getItem(UI_HIDE_KEY);
+    // Sessions restore the full-screen look (the PWA case); plain tabs start
+    // with the menu shown so the app is discoverable.
+    uiHidden = raw === '1';
+  } catch (e) {}
+  applyUiHidden();
+}
+
+function saveUiHide() {
+  try { localStorage.setItem(UI_HIDE_KEY, uiHidden ? '1' : '0'); } catch (e) {}
+}
+
+function fullscreenAvailable() {
+  return !!(document.documentElement.requestFullscreen || document.documentElement.webkitRequestFullscreen);
+}
+
+let uiHideHintTimer = 0;
+
+function applyUiHidden() {
+  document.body.classList.toggle('ui-hidden', uiHidden);
+  closeMenus();
+  const btn = document.getElementById('toggle-ui-hide');
+  if (btn) {
+    btn.textContent = uiHidden ? 'Hide Menu / Full Screen: On (F11)' : 'Hide Menu / Full Screen: Off';
+    btn.classList.toggle('active', uiHidden);
+  }
+  // Fade in a "how to get back" hint for a few seconds when hiding; never
+  // shown while the menu is visible (the button label already says it).
+  const hint = document.getElementById('ui-hidden-hint');
+  if (hint) {
+    if (uiHidden) {
+      hint.textContent = `Press ${hotkeyLabel('ui_hide')} or Esc for the menu`;
+      hint.hidden = false;
+      hint.classList.remove('fade');
+      void hint.offsetWidth; // restart the CSS transition
+      hint.classList.add('fade');
+      clearTimeout(uiHideHintTimer);
+      uiHideHintTimer = setTimeout(() => { hint.hidden = true; }, 4000);
+    } else {
+      clearTimeout(uiHideHintTimer);
+      hint.hidden = true;
+    }
+  }
+  saveUiHide();
+  if (uiHidden) {
+    setStatus(`Full screen — press ${hotkeyLabel('ui_hide')} to bring the menu back`);
+  }
+}
+
+function toggleUiHide() {
+  uiHidden = !uiHidden;
+  if (uiHidden && fullscreenAvailable() && !browserFullscreen) {
+    try {
+      const el = document.documentElement;
+      const p = el.requestFullscreen
+        ? el.requestFullscreen()
+        : el.webkitRequestFullscreen && el.webkitRequestFullscreen();
+      // Some embedders (Tauri webview, kiosk shells) hand back a promise that
+      // never settles — the chrome-hide must not depend on it. Race a short
+      // timeout and swallow both outcomes; fullscreenchange keeps the flag in
+      // step if the request does land later.
+      if (p && typeof p.then === 'function') {
+        Promise.race([p, new Promise((r) => setTimeout(r, 500))]).catch(() => {});
+      }
+    } catch (e) {
+      // Denied (e.g. no user gesture): chrome-hide still works, just windowed.
+    }
+  } else if (!uiHidden && browserFullscreen) {
+    try { document.exitFullscreen(); } catch (e) {}
+  }
+  applyUiHidden();
+}
+
+// Browser-initiated fullscreen changes (Esc exits fullscreen natively) keep the
+// flag in step; leaving fullscreen while hidden stays hidden — F11 still
+// restores the menu.
+function refreshFullscreenFlag() {
+  browserFullscreen = !!(document.fullscreenElement || document.webkitFullscreenElement);
+}
+
+// ---- Audio routing ----
+// The core mixes each game's music + SFX into ONE stereo stream per instance;
+// there is no music-vs-SFX split at the core level. These options pick WHOSE
+// mix you hear (default Player 1) or blend all players together.
+
+let audioSource = 1;
+
+function highlightAudio(n) {
+  document.querySelectorAll('#audio-menu button').forEach((btn) => {
+    btn.classList.toggle('active', parseInt(btn.dataset.audio, 10) === n);
+  });
+}
+
+async function setAudioSource(n) {
+  audioSource = n;
+  if (window.mgbaOnline?.isGuest?.()) {
+    // Guests hear whatever mix the host streams; the local pick cannot apply.
+    highlightAudio(n);
+    setStatus('Audio: the online host chooses the mix for guests');
+    return;
+  }
+  if (wasmMode) {
+    wasmModule._mgs_set_audio_source(n);
+    if (n === 0) wasmFlushAudio();
+  } else if (IS_TAURI) {
+    await invoke('set_audio_source', { source: n });
+  } else if (socket && socket.readyState === WebSocket.OPEN) {
+    socket.send(JSON.stringify({ type: 'audio_source', source: n }));
+  }
+  highlightAudio(n);
+  const label = n === 0 ? 'Muted' : n === 5 ? 'Mix all players' : `Player ${n}`;
+  setStatus(`Audio: ${label}`);
+}
+
+// ---- Quit game (unload ROM, keep the app open) ----
+
+function clearScreens() {
+  for (const s of screens) {
+    s.ctx.fillStyle = '#000';
+    s.ctx.fillRect(0, 0, GBA_WIDTH, GBA_HEIGHT);
+  }
+}
+
+async function quitGame() {
+  closeMenus();
+  try { delete window.lastRunningRom; } catch (_) { window.lastRunningRom = undefined; }
+  if (wasmMode) {
+    wasmModule._mgs_quit();
+    wasmStates = [];
+    // Re-create empty cores so the loop keeps idling cheaply; the next ROM
+    // load re-arms them (mirrors the backend's recreate-on-quit).
+    dbInit(playerCount);
+  } else if (IS_TAURI) {
+    await invoke('quit_game');
+  } else if (socket && socket.readyState === WebSocket.OPEN) {
+    socket.send(JSON.stringify({ type: 'quit_game' }));
+  }
+  resetRuntimeState();
+  clearScreens();
+  setStatus('Waiting for ROM\u2026');
+  // Back to the launcher so the next game is one D-pad+A away.
+  openLibrary();
+}
+
+// ---- Save state (quick save/load, all players together) ----
+
+async function quickSaveState() {
+  closeMenus();
+  if (wasmMode) {
+    wasmStates = [];
+    const M = wasmModule;
+    let ok = playerCount > 0;
+    for (let i = 0; i < playerCount; i++) {
+      const sz = M._mgs_save_state(i);
+      if (!sz) { ok = false; break; }
+      const ptr = M._mgs_state_ptr();
+      wasmStates.push(new Uint8Array(M.HEAPU8.slice(ptr, ptr + sz)));
+    }
+    setStatus(ok ? `Quick state saved (${wasmStates.length} player${wasmStates.length === 1 ? '' : 's'})` : 'Save state failed');
+    return;
+  }
+  if (IS_TAURI) {
+    try {
+      await invoke('save_state');
+      setStatus('Quick state saved (F5)');
+    } catch (err) {
+      setStatus('Save state failed: ' + err);
+    }
+  } else if (socket && socket.readyState === WebSocket.OPEN) {
+    socket.send(JSON.stringify({ type: 'save_state' }));
+    setStatus('Quick state saved (F5)');
+  }
+}
+
+async function quickLoadState() {
+  closeMenus();
+  if (wasmMode) {
+    const M = wasmModule;
+    if (!wasmStates.length) { setStatus('No quick state to load'); return; }
+    let ok = true;
+    for (let i = 0; i < Math.min(playerCount, wasmStates.length); i++) {
+      const blob = wasmStates[i];
+      const ptr = M._malloc(blob.length);
+      if (!ptr) { ok = false; break; }
+      M.HEAPU8.set(blob, ptr);
+      const rc = M._mgs_load_state_bytes(i, ptr, blob.length);
+      M._free(ptr);
+      if (rc !== 0) { ok = false; break; }
+    }
+    // Mirror the desktop wrapper: reset the link drivers after restoring
+    // states so stale mid-link queues/asleep flags can't corrupt the
+    // re-handshake (see mgs_reset_sio in mgba_splitscreen_web.c).
+    if (ok) M._mgs_reset_sio();
+    setStatus(ok ? 'Quick state loaded (F7)' : 'Load state failed');
+    return;
+  }
+  if (IS_TAURI) {
+    try {
+      await invoke('load_state');
+      setStatus('Quick state loaded (F7)');
+    } catch (err) {
+      setStatus('Load state failed: ' + err);
+    }
+  } else if (socket && socket.readyState === WebSocket.OPEN) {
+    socket.send(JSON.stringify({ type: 'load_state' }));
+    setStatus('Quick state loaded (F7)');
+  }
+}
+
+// ---- Screen layout + view modes (video-call style) ----
+// Four arrangements, mirroring video-call platforms:
+//   grid    — all screens equal (default)
+//   speaker — one big screen on top, the rest in a strip underneath
+//   focus   — only one screen visible (the others still emulate behind it)
+//   overlay — equal grid behind, with one screen floating enlarged on top (PiP)
+const VIEW_MODES = [
+  { id: 'grid', label: 'Grid' },
+  { id: 'speaker', label: 'Speaker (1 big + small)' },
+  { id: 'focus', label: 'Focus (single screen)' },
+  { id: 'overlay', label: 'Overlay (PiP)' },
+];
+const VIEW_KEY = 'mgba-splitscreen_view_v1';
+const BG_KEY = 'mgba-splitscreen_background_v1';
+const OUTLINES_KEY = 'mgba-splitscreen_outlines_v1';
+let outlinesOn = true; // Colored per-player borders around each screen
+
+function layout() {
+  const el = document.getElementById('screens');
+  const count = playerCount;
+  const wide = window.innerWidth >= window.innerHeight;
+
+  el.dataset.view = viewMode;
+
+  if (viewMode === 'grid') {
+    let cols, rows;
+    if (count === 1) { cols = 1; rows = 1; } // Single player: full width.
+    else if (count === 2) { cols = wide ? 2 : 1; rows = wide ? 1 : 2; }
+    else { cols = 2; rows = 2; } // 3 players sit in the 4-slot grid, 4th empty.
+    el.style.gridTemplateColumns = `repeat(${cols}, minmax(0, 1fr))`;
+    el.style.gridTemplateRows = `repeat(${rows}, minmax(0, 1fr))`;
+  } else if (viewMode === 'speaker') {
+    el.style.gridTemplateColumns = `repeat(${Math.max(1, count - 1)}, minmax(0, 1fr))`;
+    el.style.gridTemplateRows = '3fr 1fr';
+  } else if (viewMode === 'focus') {
+    el.style.gridTemplateColumns = '1fr';
+    el.style.gridTemplateRows = '1fr';
+  } else if (viewMode === 'overlay') {
+    // The rest of the screens fill the grid; the focused one floats on top (CSS).
+    el.style.gridTemplateColumns = `repeat(${Math.max(1, count - 1)}, minmax(0, 1fr))`;
+    el.style.gridTemplateRows = '1fr';
+  }
+
+  // Focus mode hides every non-focused tile (they still emulate behind it).
+  for (let i = 0; i < screens.length; i++) {
+    const cell = document.getElementById('screens').children[i];
+    if (!cell) continue;
+    cell.style.display = (viewMode === 'focus' && i !== focusPlayer) ? 'none' : '';
+  }
+}
+
+function refreshFocusLabel() {
+  const btn = document.getElementById('cycle-focus');
+  if (btn) btn.textContent = `Focus: P${focusPlayer + 1} (${hotkeyLabel('cycle_focus')})`;
+}
+
+function applyViewMode() {
+  const container = document.getElementById('screens');
+  container.dataset.view = viewMode;
+  document.querySelectorAll('#view-menu [data-view]').forEach((b) => {
+    b.classList.toggle('active', b.dataset.view === viewMode);
+  });
+  document.querySelectorAll('.screen-cell').forEach((c, i) => {
+    c.classList.toggle('focused-tile', i === focusPlayer);
+  });
+  layout();
+  refreshFocusLabel();
+  saveViewPrefs();
+}
+
+function saveViewPrefs() {
+  try {
+    localStorage.setItem(VIEW_KEY, JSON.stringify({ mode: viewMode, focus: focusPlayer }));
+  } catch (e) {}
+}
+
+function loadViewPrefs() {
+  try {
+    const raw = localStorage.getItem(VIEW_KEY);
+    if (!raw) return;
+    const v = JSON.parse(raw);
+    if (VIEW_MODES.some((m) => m.id === v.mode)) viewMode = v.mode;
+    if (Number.isInteger(v.focus) && v.focus >= 0) focusPlayer = v.focus;
+  } catch (e) {}
+}
+
+function setViewMode(mode) {
+  const m = VIEW_MODES.find((x) => x.id === mode);
+  if (!m) return;
+  viewMode = m.id;
+  applyViewMode();
+  setStatus(`View: ${m.label}`);
+}
+
+function cycleViewMode() {
+  const idx = VIEW_MODES.findIndex((m) => m.id === viewMode);
+  setViewMode(VIEW_MODES[(idx + 1) % VIEW_MODES.length].id);
+}
+
+function cycleFocusPlayer() {
+  focusPlayer = (focusPlayer + 1) % Math.max(1, playerCount);
+  applyViewMode();
+  setStatus(`Focus: P${focusPlayer + 1}`);
+}
+
+// ---- Image background (wallpaper behind the tiles) ----
+
+function setBackground(dataUrl) {
+  const el = document.getElementById('screens');
+  if (dataUrl) {
+    el.style.backgroundImage = `url("${dataUrl}")`;
+    el.style.backgroundSize = 'cover';
+    el.style.backgroundPosition = 'center';
+    try { localStorage.setItem(BG_KEY, dataUrl); } catch (e) {}
+  } else {
+    el.style.backgroundImage = '';
+    try { localStorage.removeItem(BG_KEY); } catch (e) {}
+  }
+}
+
+function loadBackground() {
+  try {
+    const data = localStorage.getItem(BG_KEY);
+    if (data) setBackground(data);
+  } catch (e) {}
+}
+
+function pickBackground() {
+  closeMenus();
+  const input = document.createElement('input');
+  input.type = 'file';
+  input.accept = 'image/*';
+  input.onchange = () => {
+    const f = input.files && input.files[0];
+    if (!f) return;
+    const r = new FileReader();
+    r.onload = () => { setBackground(r.result); setStatus('Background image set'); };
+    r.onerror = () => setStatus('Failed to read image');
+    r.readAsDataURL(f);
+  };
+  input.click();
+}
+
+function clearBackground() {
+  closeMenus();
+  setBackground(null);
+  setStatus('Background cleared');
+}
+
+// ---- Player outline toggle ----
+// The colored per-player borders around each screen are on by default; some
+// setups (splitscreen capture, projector) want a clean grid without them.
+function applyOutlines() {
+  const container = document.getElementById('screens');
+  if (container) container.classList.toggle('no-outlines', !outlinesOn);
+  const btn = document.getElementById('toggle-outlines');
+  if (btn) {
+    btn.textContent = `Player Outlines: ${outlinesOn ? 'On' : 'Off'}`;
+    btn.classList.toggle('active', outlinesOn);
+  }
+}
+
+function toggleOutlines() {
+  outlinesOn = !outlinesOn;
+  try { localStorage.setItem(OUTLINES_KEY, JSON.stringify(outlinesOn)); } catch (e) {}
+  applyOutlines();
+  setStatus(outlinesOn ? 'Player outlines on' : 'Player outlines off');
+}
+
+function loadOutlinesPref() {
+  try {
+    const raw = localStorage.getItem(OUTLINES_KEY);
+    if (raw !== null) outlinesOn = JSON.parse(raw) === true;
+  } catch (e) {}
+  applyOutlines();
+}
+
+function initScreens(count) {
+  playerCount = count;
+  focusPlayer = Math.min(focusPlayer, Math.max(0, count - 1));
+  soloPlayer = Math.min(soloPlayer, Math.max(0, count - 1));
+  updateSoloUI();
+  if (window.mgbaTouch) window.mgbaTouch.setPlayerCount(count);
+  const container = document.getElementById('screens');
+  container.innerHTML = '';
+  screens = [];
+  keyStates = new Array(count).fill(0);
+  padStates = new Array(count).fill(0);
+
+  const saveMenu = document.getElementById('save-menu');
+  saveMenu.innerHTML = '';
+
+  for (let i = 0; i < count; i++) {
+    const cell = document.createElement('div');
+    cell.className = 'screen-cell ' + (PLAYER_TAGS[i] || '');
+
+    // Bottom-right tag, colored to match the tile border.
+    const tag = document.createElement('div');
+    tag.className = 'screen-tag ' + (PLAYER_TAGS[i] || '');
+    tag.textContent = `P${i + 1}`;
+
+    const canvas = document.createElement('canvas');
+    canvas.width = GBA_WIDTH;
+    canvas.height = GBA_HEIGHT;
+
+    cell.appendChild(canvas);
+    cell.appendChild(tag);
+    container.appendChild(cell);
+
+    const ctx = canvas.getContext('2d');
+    screens.push({ canvas, ctx, width: GBA_WIDTH, height: GBA_HEIGHT,
+      imgData: ctx.createImageData(GBA_WIDTH, GBA_HEIGHT) });
+
+    const exportBtn = document.createElement('button');
+    exportBtn.textContent = `Export Save P${i + 1}\u2026`;
+    exportBtn.addEventListener('click', () => {
+      closeMenus();
+      IS_TAURI ? exportSaveTauri(i + 1) : exportSaveBrowser(i + 1);
+    });
+
+    const importBtn = document.createElement('button');
+    importBtn.textContent = `Import Save P${i + 1}\u2026`;
+    importBtn.addEventListener('click', () => {
+      closeMenus();
+      IS_TAURI ? importSaveTauri(i + 1) : importSaveBrowser(i + 1);
+    });
+
+    saveMenu.appendChild(exportBtn);
+    saveMenu.appendChild(importBtn);
+  }
+
+  applyViewMode();
+}
+
+// The backend broadcasts every emulated frame at 60 FPS and never blocks on us.
+// Rendering is coalesced to the display refresh rate with requestAnimationFrame
+// and always shows the LATEST frame: if the compositor can't keep up, stale
+// frames are dropped (not queued), so the video never lags behind real-time.
+let pendingFrame = null;
+let renderScheduled = false;
+
+// Online guests render exactly ONE screen: the seat the host assigned them.
+// The old behavior built the host's full N-screen grid from welcome{players},
+// which showed every guest more than they should see. The host now sends the
+// guest's own seat as per-seat JPEG; frames arrive as {jpeg: HTMLImageElement}
+// (legacy reliable path) or {jpeg: ImageBitmap, width, height} (v3 raw-frame
+// DataChannel) and blit straight onto the single canvas. Paid attention to
+// decode-freshness: online.js only delivers the NEWEST decoded frame here.
+function applyGuestSeatView() {
+  if (!window.mgbaOnline?.isGuest?.()) return;
+  const seat = window.mgbaOnline.assignedPlayer?.();
+  if (!(Number.isInteger(seat) && seat >= 0)) return;
+  playerCount = 1;
+  initScreens(1);
+  const cell = document.querySelector('#screens .screen-cell');
+  if (cell) {
+    cell.classList.add('guest-seat-tile', PLAYER_TAGS[seat] || '');
+    // initScreens(1) defaults the tag to P1; the guest drives seat N, so
+    // relabel it to the real seat (border color is already right via the
+    // PLAYER_TAGS class).
+    cell.classList.remove('focused-tile');
+    const tag = cell.querySelector('.screen-tag');
+    if (tag) tag.textContent = `P${seat + 1}`;
+  }
+  applyViewMode();
+}
+
+function onGuestVideoStream(stream) {
+  const cell = document.querySelector('#screens .screen-cell');
+  if (!cell || !stream) return;
+  const canvas = cell.querySelector('canvas');
+  if (!canvas) return;
+  let video = cell.querySelector('video.guest-live-video');
+  if (!video) {
+    video = document.createElement('video');
+    video.className = 'guest-live-video';
+    video.autoplay = true;
+    video.playsInline = true;
+    video.muted = true; // game audio already arrives through the audio channel
+    cell.insertBefore(video, canvas);
+  }
+  video.srcObject = stream;
+  // Keep the existing decoded-frame canvas visible until the native stream
+  // actually produces a frame. If RTP stalls, the JPEG fallback remains
+  // visible instead of replacing it with a black video element.
+  video.onloadeddata = () => {
+    if (video.videoWidth > 0 && video.videoHeight > 0) {
+      canvas.hidden = true;
+      window.mgbaOnline?.videoTrackReady?.();
+    }
+  };
+  video.onerror = () => {
+    canvas.hidden = false;
+    window.mgbaOnline?.videoTrackFailed?.();
+  };
+  for (const track of stream.getVideoTracks()) {
+    track.addEventListener('ended', () => {
+      canvas.hidden = false;
+      window.mgbaOnline?.videoTrackFailed?.();
+    }, { once: true });
+  }
+  video.play().catch((error) => {
+    canvas.hidden = false;
+    window.mgbaOnline?.videoTrackFailed?.();
+    console.warn('Guest live video autoplay was blocked:', error);
+  });
+}
+
+function onFrame(data) {
+  if (window.mgbaOnline?.isHost()) window.mgbaOnline.broadcastFrame(data);
+  pendingFrame = data;
+  if (renderScheduled) return;
+  renderScheduled = true;
+  requestAnimationFrame(() => {
+    renderScheduled = false;
+    const frame = pendingFrame;
+    pendingFrame = null;
+    if (!frame) return;
+    if (frame.jpeg) {
+      // Online guest, per-seat JPEG: one screen, drawn image-first. The frame
+      // is either an HTMLImageElement (legacy) or an ImageBitmap (v3 raw
+      // frames); both have width/naturalWidth. Bitmaps own GPU memory, so
+      // close them once drawn (a pending newer frame may already be queued).
+      const img = frame.jpeg;
+      const s = screens[0];
+      if (s) {
+        const w = img.naturalWidth || img.width;
+        const h = img.naturalHeight || img.height;
+        if (s.canvas.width !== w || s.canvas.height !== h) {
+          s.canvas.width = w;
+          s.canvas.height = h;
+          s.imgData = null;
+        }
+        s.ctx.drawImage(img, 0, 0);
+        if (typeof img.close === 'function') img.close();
+      }
+      return;
+    }
+    const bytes = new Uint8ClampedArray(frame);
+    for (let i = 0; i < playerCount; i++) {
+      if (frame.byteLength < FRAME_SIZE * (i + 1)) break;
+      const off = i * FRAME_SIZE;
+      screens[i].imgData.data.set(bytes.subarray(off, off + FRAME_SIZE));
+      screens[i].ctx.putImageData(screens[i].imgData, 0, 0);
+    }
+  });
+}
+
+// ---- Debug overlay (backend status text frames) ----
+
+let overlayLastAt = 0;
+function pushOverlay(text) {
+  if (!debugOn) return; // Debug log toggled off: skip all DOM work.
+  // Defensive throttle: a debug flood (e.g. SIO chatter) must never DOM-thrash
+  // the main thread and make inputs feel laggy. Cap updates at ~30/s; the full
+  // stream is still in the server log, and WARN/ERROR lines are rare.
+  const now = performance.now();
+  if (now - overlayLastAt < 33) return;
+  overlayLastAt = now;
+  const el = document.getElementById('overlay');
+  const line = document.createElement('div');
+  line.className = 'line';
+  if (text.startsWith('WARN') || text.startsWith('[mGBA]')) line.className += ' warn';
+  else if (text.startsWith('ERROR') || text.includes('fail')) line.className += ' err';
+  else if (text.startsWith('OK') || text.startsWith('ROM loaded')) line.className += ' ok';
+  line.textContent = text;
+  el.appendChild(line);
+  while (el.children.length > OVERLAY_MAX) el.removeChild(el.firstChild);
+}
+
+// ---- Debug log toggle ----
+// The overlay (per-second stats + mGBA WARN/ERROR lines) can be shown/hidden at
+// runtime; the preference persists so a "quiet" setting sticks across sessions.
+const DEBUG_KEY = 'mgba-splitscreen_debug_v2'; // v2: default is now OFF (bump discards the old stored "on")
+
+function applyDebugToggle() {
+  const el = document.getElementById('overlay');
+  if (el) el.style.display = debugOn ? '' : 'none';
+  const btn = document.getElementById('toggle-debug');
+  if (btn) {
+    btn.textContent = `Debug Log: ${debugOn ? 'On' : 'Off'}`;
+    btn.classList.toggle('active', debugOn);
+  }
+}
+
+function toggleDebug() {
+  debugOn = !debugOn;
+  try { localStorage.setItem(DEBUG_KEY, JSON.stringify(debugOn)); } catch (e) {}
+  applyDebugToggle();
+  if (!debugOn) {
+    const el = document.getElementById('overlay');
+    if (el) el.innerHTML = '';
+  }
+  setStatus(debugOn ? 'Debug log on' : 'Debug log off');
+}
+
+function loadDebugToggle() {
+  try {
+    const raw = localStorage.getItem(DEBUG_KEY);
+    if (raw !== null) debugOn = JSON.parse(raw) === true;
+  } catch (e) {}
+  applyDebugToggle();
+}
+
+async function setKeys(player, keys) {
+  if (window.mgbaOnline?.isGuest()) {
+    window.mgbaOnline.sendInput(player - 1, keys);
+    return;
+  }
+  if (wasmMode) {
+    // Frontend keys are 1-indexed; the bridge expects 0-indexed players.
+    wasmModule._mgs_set_keys(player - 1, keys);
+  } else if (IS_TAURI) {
+    await invoke('set_keys', { player, keys });
+  } else if (socket && socket.readyState === WebSocket.OPEN) {
+    socket.send(JSON.stringify({ type: 'keys', player, keys }));
+  }
+}
+
+// The backend gets the union of keyboard + gamepad + touch input for a player.
+function sendKeys(p) {
+  setKeys(p + 1, keyStates[p] | padStates[p] | touchStateFor(p));
+}
+
+async function handleKey(e, isDown) {
+  // Remap overlay open: keys go to remapping, never to the game.
+  const overlay = document.getElementById('remap-overlay');
+  if (overlay && !overlay.hidden) {
+    if (e.code === 'Escape') {
+      if (isDown) closeRemap();
+      return;
+    }
+    if (isDown) remapCaptureKey(e);
+    return;
+  }
+
+  // Pause menu open: arrows move, Enter/Space select, Escape (or the pause
+  // hotkey itself) resumes.
+  if (pauseOpen()) {
+    if (!isDown) return;
+    if (e.code === 'Escape') { doResume(); return; }
+    const pauseCode = hotkeys.pause && hotkeys.pause.keyboard;
+    if (pauseCode && e.code === pauseCode) { triggerHotkey('pause'); return; }
+    if (e.code === 'ArrowUp') { pauseNavigate(-1); e.preventDefault(); return; }
+    if (e.code === 'ArrowDown') { pauseNavigate(1); e.preventDefault(); return; }
+    if (e.code === 'Enter' || e.code === 'Space') { pauseSelect(); e.preventDefault(); return; }
+    return;
+  }
+
+  // Library overlay open: arrow keys navigate, Enter selects, Escape closes.
+  if (libraryOpen()) {
+    if (!isDown) return;
+    if (e.code === 'Escape') { closeLibrary(); return; }
+    if (e.code === 'ArrowLeft') { libNavigate(-1, 0); e.preventDefault(); return; }
+    if (e.code === 'ArrowRight') { libNavigate(1, 0); e.preventDefault(); return; }
+    if (e.code === 'ArrowUp') { libNavigate(0, -1); e.preventDefault(); return; }
+    if (e.code === 'ArrowDown') { libNavigate(0, 1); e.preventDefault(); return; }
+    if (e.code === 'Enter' || e.code === 'Space') { libSelect(); e.preventDefault(); return; }
+    return;
+  }
+
+  // A menu is open: let the menu have the keys; Escape closes it.
+  if (menuOpen()) {
+    if (e.code === 'Escape') closeMenus();
+    return;
+  }
+
+  // Full screen (menu hidden): the ONLY keys that bring the chrome back are
+  // the hide hotkey itself and Escape (a second Esc also exits the browser's
+  // fullscreen natively — the keydown order below tolerates that). Everything
+  // else keeps flowing to the game.
+  if (uiHidden) {
+    const hideCode = hotkeys.ui_hide && hotkeys.ui_hide.keyboard;
+    if ((hideCode && e.code === hideCode) || e.code === 'Escape') {
+      e.preventDefault();
+      if (isDown) toggleUiHide();
+      return;
+    }
+  }
+
+  // Global hotkeys (turbo / quick save / quick load / pause) — remappable, and
+  // checked before per-player keys so a hotkey never doubles as game input.
+  for (const action of HOTKEY_ACTIONS) {
+    const code = hotkeys[action.id].keyboard;
+    if (!code || e.code !== code) continue;
+    e.preventDefault();
+    if (isDown) triggerHotkey(action.id);
+    return;
+  }
+
+  // Solo keyboard mode: digits 1-4 pick the active player, and P1's control
+  // map drives ONLY that player. All other keys are ignored in this mode, so
+  // the same controls work regardless of which player is selected.
+  if (soloKeyboard) {
+    if (e.code >= 'Digit1' && e.code <= 'Digit4') {
+      const n = parseInt(e.code.slice(5), 10);
+      if (n >= 1 && n <= playerCount) {
+        e.preventDefault();
+        if (isDown) setSoloPlayer(n - 1);
+      }
+      return;
+    }
+    const bit = controls[0].keyboard[e.code];
+    if (bit === undefined) return;
+    const p = soloPlayer;
+    if (isDown) keyStates[p] |= bit;
+    else keyStates[p] &= ~bit;
+    sendKeys(p);
+    e.preventDefault();
+    return;
+  }
+
+  let handled = false;
+  for (let p = 0; p < playerCount; p++) {
+    const map = controls[p].keyboard;
+    const bit = map[e.code];
+    if (bit === undefined) continue;
+
+    handled = true;
+    if (isDown) keyStates[p] |= bit;
+    else keyStates[p] &= ~bit;
+    sendKeys(p);
+  }
+  // Stop browser defaults (scrolling, focused-button activation) for every key
+  // the emulator uses, so game input never leaks into the UI.
+  if (handled) e.preventDefault();
+}
+
+// ---- Game library (controller-navigable launcher) ----
+// Two sources of games shown as one grid:
+//   - recents: games loaded this session (persisted; click/select to relaunch)
+//   - library: ROMs scanned from a folder the user added (Tauri: scan_games_dir
+//     command; web: <input webkitdirectory>). Box art comes from a sibling image
+//     with the same stem; otherwise a generated gradient tile stands in.
+const RECENTS_KEY = 'mgba-splitscreen_recents_v1';
+const LIBRARY_KEY = 'mgba_splitscreen_library_v1';
+
+let recents = [];        // { name, path (null on web), boxArtPath }
+let libraryGames = [];   // Tauri: { name, path, boxArtPath } | web: { name, file, boxArtUrl }
+let libItems = [];       // focusable tiles + footer buttons, in order
+let libFocus = 0;
+let libCols = 4;
+
+function loadRecents() {
+  recents = [];
+  try {
+    const raw = localStorage.getItem(RECENTS_KEY);
+    if (raw) recents = JSON.parse(raw).filter((r) => r && r.name);
+  } catch (e) {}
+}
+
+function saveRecents() {
+  try { localStorage.setItem(RECENTS_KEY, JSON.stringify(recents)); } catch (e) {}
+}
+
+function recordRecent(name, path, boxArtPath, key) {
+  recents = recents.filter((r) => (path ? r.path !== path : r.name !== name));
+  recents.unshift({ name, path: path || null, boxArtPath: boxArtPath || null, key: key || null });
+  if (recents.length > 12) recents.length = 12;
+  saveRecents();
+}
+
+// Persisted library (Tauri only — paths are stable; web File objects aren't).
+function loadLibrary() {
+  libraryGames = [];
+  if (!IS_TAURI) return;
+  try {
+    const raw = localStorage.getItem(LIBRARY_KEY);
+    if (raw) libraryGames = JSON.parse(raw).filter((g) => g && g.path);
+  } catch (e) {}
+}
+
+function saveLibrary() {
+  if (!IS_TAURI) return;
+  try {
+    localStorage.setItem(
+      LIBRARY_KEY,
+      JSON.stringify(libraryGames.map((g) => ({ name: g.name, path: g.path, boxArtPath: g.boxArtPath || null })))
+    );
+  } catch (e) {}
+}
+
+function libraryOpen() {
+  const el = document.getElementById('library-overlay');
+  return !!(el && !el.hidden);
+}
+
+function openLibrary() {
+  closeMenus();
+  document.getElementById('library-overlay').hidden = false;
+  renderLibrary();
+}
+
+function closeLibrary() {
+  document.getElementById('library-overlay').hidden = true;
+  libMode = 'browse';
+  pendingGame = null;
+  setStatus('Library closed');
+}
+
+function gradientFor(s) {
+  let h = 0;
+  for (let i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) >>> 0;
+  const hue = h % 360;
+  return `linear-gradient(135deg, hsl(${hue},52%,36%), hsl(${(hue + 70) % 360},52%,20%))`;
+}
+
+function makePlaceholderArt(title) {
+  const ph = document.createElement('div');
+  ph.className = 'library-placeholder';
+  ph.style.background = gradientFor(title);
+  const t = document.createElement('span');
+  t.textContent = title;
+  ph.appendChild(t);
+  return ph;
+}
+
+function makeLibraryTile(title, boxArtUrl, badge, onSelect) {
+  const tile = document.createElement('button');
+  tile.className = 'library-tile';
+  tile.addEventListener('click', onSelect);
+
+  const art = document.createElement('div');
+  art.className = 'library-art';
+  if (boxArtUrl) {
+    const img = document.createElement('img');
+    img.src = boxArtUrl;
+    img.alt = '';
+    img.loading = 'lazy';
+    img.addEventListener('error', () => {
+      img.remove();
+      art.appendChild(makePlaceholderArt(title));
+    });
+    art.appendChild(img);
+  } else {
+    art.appendChild(makePlaceholderArt(title));
+  }
+
+  if (badge) {
+    const b = document.createElement('span');
+    b.className = 'library-badge';
+    b.textContent = badge;
+    art.appendChild(b);
+  }
+
+  const label = document.createElement('span');
+  label.className = 'library-name';
+  label.textContent = title;
+
+  tile.append(art, label);
+  return tile;
+}
+
+function addSectionTitle(grid, text) {
+  const h = document.createElement('div');
+  h.className = 'library-section-title';
+  h.textContent = text;
+  grid.appendChild(h);
+}
+
+function computeLibCols() {
+  const grid = document.getElementById('library-grid');
+  const cols = getComputedStyle(grid).gridTemplateColumns.split(' ').filter(Boolean).length;
+  return cols || 4;
+}
+
+function renderLibrary() {
+  const grid = document.getElementById('library-grid');
+  grid.innerHTML = '';
+  libItems = [];
+  libFocus = 0;
+  libCols = 1;
+
+  // Player-count step: pick the game first, then how many linked players.
+  if (libMode === 'players') {
+    document.querySelector('.library-actions').style.display = 'none';
+    const title = document.createElement('div');
+    title.className = 'library-section-title';
+    title.textContent = `How many players? \u2014 ${pendingGame ? pendingGame.name : ''}`;
+    grid.appendChild(title);
+    for (let n = 1; n <= 4; n++) {
+      const b = document.createElement('button');
+      b.className = 'library-choice';
+      b.textContent = `${n} Player${n > 1 ? 's' : ''}`;
+      b.addEventListener('click', () => startGameWithPlayers(n));
+      grid.appendChild(b);
+      libItems.push(b);
+    }
+    const back = document.createElement('button');
+    back.className = 'library-choice';
+    back.textContent = 'Back';
+    back.addEventListener('click', () => { libMode = 'browse'; renderLibrary(); });
+    grid.appendChild(back);
+    libItems.push(back);
+    document.getElementById('library-hint').textContent =
+      'D-pad to move \u00b7 A to select \u00b7 B to go back';
+    applyLibraryFocus();
+    return;
+  }
+  document.querySelector('.library-actions').style.display = '';
+
+  if (recents.length) {
+    addSectionTitle(grid, 'Recent');
+    for (const r of recents) {
+      const tile = makeLibraryTile(r.name, null, '\u2605', () => selectRecent(r));
+      grid.appendChild(tile);
+      libItems.push(tile);
+      if (r.boxArtPath) loadBoxArt({ boxArtPath: r.boxArtPath }, tile);
+      else maybeLoadOnlineBoxArt(tile, r.name);
+    }
+  }
+
+  addSectionTitle(grid, 'Library');
+  if (!libraryGames.length) {
+    const empty = document.createElement('div');
+    empty.className = 'library-empty';
+    empty.textContent = 'No games yet \u2014 use Add Folder to scan a folder of ROMs.';
+    grid.appendChild(empty);
+  } else {
+    for (const g of libraryGames) {
+      const tile = makeLibraryTile(g.name, g.boxArtUrl || null, null, () => selectLibraryGame(g));
+      grid.appendChild(tile);
+      libItems.push(tile);
+      if (g.boxArtUrl) {
+        // Local art already set; nothing more to do.
+      } else if (g.boxArtPath) loadBoxArt(g, tile);
+      else maybeLoadOnlineBoxArt(tile, g.name);
+    }
+  }
+
+  // Footer actions join the focus list (reachable with D-pad Down from the grid).
+  for (const id of ['library-add-folder', 'library-load-rom', 'library-close']) {
+    libItems.push(document.getElementById(id));
+  }
+
+  libCols = computeLibCols();
+  applyLibraryFocus();
+  document.getElementById('library-hint').textContent =
+    'D-pad to move \u00b7 A to select \u00b7 B to close';
+}
+
+function applyLibraryFocus() {
+  libItems.forEach((el, i) => el.classList.toggle('focused', i === libFocus));
+  const el = libItems[libFocus];
+  if (el && el.scrollIntoView) el.scrollIntoView({ block: 'nearest', inline: 'nearest' });
+}
+
+function libNavigate(dx, dy) {
+  if (!libItems.length) return;
+  if (dx) libFocus = Math.max(0, Math.min(libItems.length - 1, libFocus + dx));
+  else if (dy) libFocus = Math.max(0, Math.min(libItems.length - 1, libFocus + dy * Math.max(1, libCols)));
+  applyLibraryFocus();
+}
+
+function libSelect() {
+  const el = libItems[libFocus];
+  if (el) el.click();
+}
+
+async function loadBoxArt(game, tile) {
+  try {
+    const dataUrl = await invoke('read_box_art', { path: game.boxArtPath });
+    const art = tile.querySelector('.library-art');
+    const img = document.createElement('img');
+    img.src = dataUrl;
+    img.alt = '';
+    img.addEventListener('error', () => img.remove());
+    art.insertBefore(img, art.firstChild);
+    const ph = art.querySelector('.library-placeholder');
+    if (ph) ph.remove();
+  } catch (e) {
+    // Keep the generated placeholder.
+  }
+}
+
+async function selectRecent(r) {
+  if (IS_TAURI && r.path) {
+    choosePlayers({ name: r.name, path: r.path, boxArtPath: r.boxArtPath });
+    return;
+  }
+  // Web: relaunch from the IndexedDB cache if we still have the bytes;
+  // otherwise the user re-picks the file.
+  if (r.key) {
+    const cached = await getCachedGame(r.key);
+    if (cached) {
+      choosePlayers({ name: r.name, key: r.key });
+      return;
+    }
+  }
+  closeLibrary();
+  pickRomBrowser();
+}
+
+async function selectLibraryGame(g) {
+  if (IS_TAURI) choosePlayers({ name: g.name, path: g.path, boxArtPath: g.boxArtPath });
+  else choosePlayers({ name: g.name, file: g.file });
+}
+
+async function loadGamePath(path, name, boxArtPath) {
+  setStatus(`Loading: ${name}`);
+  await invoke('load_rom', { path });
+  resetRuntimeState();
+  setStatus(`Running: ${name}`);
+  try { window.mgbaTouch?.setRom?.(name); } catch (_) {}
+  recordRecent(name, path, boxArtPath);
+  closeLibrary();
+}
+
+async function loadGameFile(file, name) {
+  setStatus(`Loading: ${name}`);
+  if (wasmMode) {
+    const bytes = new Uint8Array(await file.arrayBuffer());
+    const ok = wasmLoadRomBytes(bytes) === 0;
+    if (ok) resetRuntimeState();
+    setStatus(ok ? `Running: ${name}` : 'Error: ROM load failed in browser engine');
+    if (ok) { try { window.mgbaTouch?.setRom?.(name); } catch (_) {} }
+    let key = null;
+    if (ok) {
+      key = `rom_${name}`;
+      try { await cacheGameBytes(key, name, bytes); } catch (e) { key = null; }
+    }
+    recordRecent(name, null, null, key);
+    closeLibrary();
+    return;
+  }
+  const resp = await fetch('/load_rom', { method: 'POST', body: file });
+  if (resp.ok) resetRuntimeState();
+  setStatus(resp.ok ? `Running: ${name}` : 'Error: ' + (await resp.text()));
+  // Web: cache the bytes so this recent can relaunch without re-picking.
+  let key = null;
+  if (resp.ok) {
+    key = `rom_${name}`;
+    try { await cacheGameBytes(key, name, new Uint8Array(await file.arrayBuffer())); } catch (e) { key = null; }
+  }
+  recordRecent(name, null, null, key);
+  closeLibrary();
+}
+
+async function addFolder() {
+  if (IS_TAURI) await addFolderTauri();
+  else addFolderWeb();
+}
+
+async function addFolderTauri() {
+  const { open } = window.__TAURI__.dialog;
+  const dir = await open({ directory: true, multiple: false });
+  if (!dir) return;
+  setStatus('Scanning folder\u2026');
+  const entries = await invoke('scan_games_dir', { path: dir });
+  libraryGames = entries.map((e) => ({ name: e.name, path: e.path, boxArtPath: e.box_art || null }));
+  saveLibrary();
+  renderLibrary();
+  setStatus(`Library: ${libraryGames.length} game${libraryGames.length === 1 ? '' : 's'}`);
+}
+
+function addFolderWeb() {
+  const input = document.createElement('input');
+  input.type = 'file';
+  input.webkitdirectory = true;
+  input.accept = romAccept();
+  input.onchange = () => {
+    const files = [...input.files];
+    const images = new Map();
+    for (const f of files) {
+      if (/\.(png|jpe?g|webp|gif)$/i.test(f.name)) {
+        const stem = f.name.replace(/\.[^.]+$/, '').toLowerCase();
+        if (!images.has(stem)) images.set(stem, URL.createObjectURL(f));
+      }
+    }
+    libraryGames = files
+      .filter((f) => isRomName(f.name))
+      .map((f) => ({
+        name: f.name.replace(/\.[^.]+$/, ''),
+        file: f,
+        boxArtUrl: images.get(f.name.replace(/\.[^.]+$/, '').toLowerCase()) || null,
+      }));
+    renderLibrary();
+    setStatus(`Library: ${libraryGames.length} game${libraryGames.length === 1 ? '' : 's'}`);
+  };
+  input.click();
+}
+
+// ---- Web game cache (IndexedDB) ----
+// Browsers can't re-open an arbitrary local file path from JS, so the web build
+// caches the bytes of recently played games in IndexedDB (GBA ROMs are 4-64MB;
+// localStorage's ~5MB cap is far too small). A cached recent relaunches instantly
+// instead of forcing the user to re-pick the file.
+const CACHE_DB = 'mgba-splitscreen_cache';
+const CACHE_STORE = 'games';
+const CACHE_MAX = 6;
+
+function openCacheDb() {
+  return new Promise((resolve, reject) => {
+    if (!window.indexedDB) return reject(new Error('IndexedDB unavailable'));
+    const req = indexedDB.open(CACHE_DB, 1);
+    req.onupgradeneeded = () => {
+      if (!req.result.objectStoreNames.contains(CACHE_STORE)) {
+        req.result.createObjectStore(CACHE_STORE, { keyPath: 'key' });
+      }
+    };
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+}
+
+function txDone(tx) {
+  return new Promise((resolve, reject) => {
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+    tx.onabort = () => reject(tx.error);
+  });
+}
+
+function idbGet(store, key) {
+  return new Promise((resolve, reject) => {
+    const req = store.get(key);
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+}
+
+async function cacheGameBytes(key, name, bytes) {
+  try {
+    const db = await openCacheDb();
+    const tx = db.transaction(CACHE_STORE, 'readwrite');
+    tx.objectStore(CACHE_STORE).put({ key, name, bytes, ts: Date.now() });
+    await txDone(tx);
+    // Drop the oldest entries beyond CACHE_MAX (LRU by timestamp).
+    const all = await idbGet(db.transaction(CACHE_STORE, 'readonly').objectStore(CACHE_STORE), '__all__')
+      .catch(() => null);
+    const list = all ? [all] : await new Promise((res, rej) => {
+      const r = db.transaction(CACHE_STORE, 'readonly').objectStore(CACHE_STORE).getAll();
+      r.onsuccess = () => res(r.result);
+      r.onerror = () => rej(r.error);
+    });
+    if (list.length > CACHE_MAX) {
+      list.sort((a, b) => (a.ts || 0) - (b.ts || 0));
+      const drop = list.slice(0, list.length - CACHE_MAX);
+      const dtx = db.transaction(CACHE_STORE, 'readwrite');
+      const ds = dtx.objectStore(CACHE_STORE);
+      for (const item of drop) ds.delete(item.key);
+      await txDone(dtx);
+    }
+    db.close();
+  } catch (e) {
+    // Cache is best-effort; the game still loads fine either way.
+  }
+}
+
+async function getCachedGame(key) {
+  try {
+    const db = await openCacheDb();
+    const item = await idbGet(db.transaction(CACHE_STORE, 'readonly').objectStore(CACHE_STORE), key);
+    db.close();
+    return item || null;
+  } catch (e) {
+    return null;
+  }
+}
+
+// ---- Box art: online fallback ----
+// libretro-thumbnails hosts a large GBA box-art collection keyed by the game's
+// (region-stripped) title. Best-effort: if a tile has no local image, try the
+// network; on any failure the generated gradient placeholder stays put.
+function libretroLookupName(name) {
+  return name
+    .replace(/\s*\((?:U|USA|E|Europe|J|Japan|F|G|S|AU|World)\)/gi, '')
+    .replace(/\s*\[.*?\]/g, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function maybeLoadOnlineBoxArt(tile, name) {
+  const art = tile.querySelector('.library-art');
+  if (!art || art.querySelector('img')) return;
+  const img = document.createElement('img');
+  img.alt = '';
+  img.loading = 'lazy';
+  img.addEventListener('error', () => img.remove());
+  img.addEventListener('load', () => {
+    art.insertBefore(img, art.firstChild);
+    const ph = art.querySelector('.library-placeholder');
+    if (ph) ph.remove();
+  });
+  img.src = `https://thumbnails.libretro.com/GBA/Named_Boxarts/${encodeURIComponent(libretroLookupName(name))}.png`;
+}
+
+// ---- Player-count step in the library flow (game -> players -> start) ----
+let libMode = 'browse'; // 'browse' | 'players'
+let pendingGame = null;
+
+function choosePlayers(game) {
+  pendingGame = game;
+  libMode = 'players';
+  renderLibrary();
+}
+
+async function startGameWithPlayers(n) {
+  const g = pendingGame;
+  if (!g) return;
+  await setPlayerCount(n);
+  if (g.path) {
+    await loadGamePath(g.path, g.name, g.boxArtPath);
+  } else if (g.file) {
+    await loadGameFile(g.file, g.name);
+  } else if (g.key) {
+    // Web: relaunch from the IndexedDB cache when available.
+    const cached = await getCachedGame(g.key);
+    if (cached) {
+      setStatus(`Loading: ${g.name}`);
+      if (wasmMode) {
+        const ok = wasmLoadRomBytes(cached.bytes) === 0;
+        if (ok) resetRuntimeState();
+        setStatus(ok ? `Running: ${g.name}` : 'Error: ROM load failed');
+        if (ok) { try { window.mgbaTouch?.setRom?.(g.name); } catch (_) {} }
+      } else {
+        const resp = await fetch('/load_rom', { method: 'POST', body: cached.bytes });
+        if (resp.ok) resetRuntimeState();
+        setStatus(resp.ok ? `Running: ${g.name}` : 'Error: ' + (await resp.text()));
+      }
+      recordRecent(g.name, null, null, g.key);
+      closeLibrary();
+    } else {
+      closeLibrary();
+      pickRomBrowser();
+    }
+  }
+}
+
+// ---- Pause menu (controller-navigable) ----
+// Opens automatically when emulation is paused; every in-game action (resume,
+// save/load state, player count, library, quit ROM) is one D-pad+A away.
+let pauseItems = [];
+let pauseFocus = 0;
+let pauseSub = 'main'; // 'main' | 'players'
+
+function pauseOpen() {
+  const el = document.getElementById('pause-overlay');
+  return !!(el && !el.hidden);
+}
+
+function openPauseMenu() {
+  pauseSub = 'main';
+  renderPauseMenu();
+  document.getElementById('pause-overlay').hidden = false;
+}
+
+function closePauseMenu() {
+  document.getElementById('pause-overlay').hidden = true;
+}
+
+function renderPauseMenu() {
+  const container = document.getElementById('pause-items');
+  container.innerHTML = '';
+  pauseItems = [];
+  const addItem = (label, fn, id) => {
+    const b = document.createElement('button');
+    if (id) b.id = id;
+    b.textContent = label;
+    b.addEventListener('click', fn);
+    container.appendChild(b);
+    pauseItems.push(b);
+  };
+  if (pauseSub === 'players') {
+    for (let n = 1; n <= 4; n++) {
+      addItem(`${n} Player${n > 1 ? 's' : ''}`, async () => {
+        // setPlayerCount rebuilds the emulator and unpauses (which closes the
+        // pause menu via resetRuntimeState), then the game is running again.
+        await setPlayerCount(n);
+        pauseSub = 'main';
+        setStatus(`${n} players`);
+      });
+    }
+    addItem('Back', () => { pauseSub = 'main'; renderPauseMenu(); });
+  } else {
+    addItem('Resume', doResume, 'pause-resume');
+    addItem('Quick Save State', quickSaveState, 'pause-save');
+    addItem('Quick Load State', quickLoadState, 'pause-load');
+    addItem('Players\u2026', () => { pauseSub = 'players'; renderPauseMenu(); }, 'pause-players');
+    addItem('Games Library', () => { closePauseMenu(); openLibrary(); }, 'pause-library');
+    // Voluntary bug reports: this is how phone guests (no menubar) tell us
+    // about live problems like garbled audio. Details are collected at the
+    // moment of the click; the crash reporter opens GitHub from the gesture.
+    addItem('Report an Issue\u2026', () => {
+      closePauseMenu();
+      if (window.mgbaCrash?.manualReport) window.mgbaCrash.manualReport();
+      else setStatus('Issue reporter unavailable in this build.');
+    }, 'pause-report');
+    addItem('Quit ROM', async () => { closePauseMenu(); await quitGame(); }, 'pause-quit');
+  }
+  pauseFocus = 0;
+  applyPauseFocus();
+}
+
+function applyPauseFocus() {
+  pauseItems.forEach((el, i) => el.classList.toggle('focused', i === pauseFocus));
+  const el = pauseItems[pauseFocus];
+  if (el && el.scrollIntoView) el.scrollIntoView({ block: 'nearest' });
+}
+
+function pauseNavigate(dy) {
+  if (!pauseItems.length) return;
+  pauseFocus = Math.max(0, Math.min(pauseItems.length - 1, pauseFocus + dy));
+  applyPauseFocus();
+}
+
+function pauseSelect() {
+  const el = pauseItems[pauseFocus];
+  if (el) el.click();
+}
+
+async function doResume() {
+  paused = false;
+  if (IS_TAURI) {
+    await invoke('set_paused', { paused: false });
+  } else if (socket && socket.readyState === WebSocket.OPEN) {
+    socket.send(JSON.stringify({ type: 'pause', paused: false }));
+  }
+  highlightPause(false);
+  closePauseMenu();
+  setStatus('Resumed');
+}
+
+async function resumeIfPaused() {
+  if (!paused) return;
+  await doResume();
+}
+
+// ---- Gamepad polling ----
+// Poll navigator.getGamepads() on the animation frame. Controller slot i drives
+// player i+1; each player's mask is the union of its button + axis maps.
+const PAD_AXIS_DEADZONE = 0.5;
+const prevPadPressed = new Set(); // "playerIdx:buttonIdx" pressed last frame
+
+function pollGamepads() {
+  if (!navigator.getGamepads) return;
+  const pads = navigator.getGamepads();
+  const nowPressed = new Set();
+  const overlayOpen = remapOverlayOpen();
+  const libOpen = libraryOpen();
+
+  // Populate nowPressed for all four pads (not just active players) so remap
+  // navigation/capture works even for a player beyond the current playerCount.
+  for (let p = 0; p < 4; p++) {
+    const pad = pads[p];
+    if (!pad) continue;
+    for (let i = 0; i < pad.buttons.length; i++) {
+      if (pad.buttons[i].pressed) nowPressed.add(`${p}:${i}`);
+    }
+  }
+
+  // Game input: only when the remap overlay is closed, and only for active
+  // players. padStates is left untouched while the overlay is open so closing
+  // it resumes cleanly from the next fresh poll.
+  const hotkeyConsumed = new Set(); // "p:idx" consumed by a global hotkey
+  if (!overlayOpen && !libOpen) {
+    // Global hotkeys from gamepads: fire on a fresh press and consume the
+    // button so it doesn't ALSO feed the player's game mask this frame.
+    for (let p = 0; p < 4; p++) {
+      const pad = pads[p];
+      if (!pad) continue;
+      for (const action of HOTKEY_ACTIONS) {
+        const gb = hotkeys[action.id].gamepad;
+        if (gb === null || gb === undefined) continue;
+        const key = `${p}:${gb}`;
+        if (pad.buttons[gb] && pad.buttons[gb].pressed && !prevPadPressed.has(key)) {
+          hotkeyConsumed.add(key);
+          triggerHotkey(action.id);
+        }
+      }
+    }
+
+    for (let p = 0; p < playerCount; p++) {
+      const pad = pads[p];
+      let mask = 0;
+      if (pad) {
+        const gb = controls[p].gamepadButtons;
+        for (const idxStr in gb) {
+          if (hotkeyConsumed.has(`${p}:${idxStr}`)) continue;
+          const b = pad.buttons[parseInt(idxStr, 10)];
+          if (b && b.pressed) mask |= gb[idxStr];
+        }
+        const ax = controls[p].gamepadAxes;
+        for (const axStr in ax) {
+          const v = pad.axes[parseInt(axStr, 10)];
+          if (v === undefined) continue;
+          if (v <= -PAD_AXIS_DEADZONE) mask |= ax[axStr].neg;
+          else if (v >= PAD_AXIS_DEADZONE) mask |= ax[axStr].pos;
+        }
+      }
+      if (mask !== padStates[p]) {
+        padStates[p] = mask;
+        sendKeys(p);
+      }
+    }
+  }
+
+  let captured = false;
+
+  // Remap capture / cancel: a button freshly pressed on the remapped player's
+  // controller. Runs BEFORE navigation so the A press that selects a cell can't
+  // also be captured as the new binding in the same frame.
+  if (remapListening && pads[remapPlayer]) {
+    const id = remapListening.id;
+    const prefix = remapMode === 'hotkeys' ? 'Hotkey' : `Player ${remapPlayer + 1}`;
+    for (const key of nowPressed) {
+      if (!key.startsWith(`${remapPlayer}:`) || prevPadPressed.has(key)) continue;
+      const idx = parseInt(key.split(':')[1], 10);
+
+      if (remapListening.source === 'keyboard') {
+        // A keyboard capture can't be completed by a gamepad: treat any fresh
+        // button as "cancel" so a gamepad-only user is never stuck.
+        remapListening = null;
+        captured = true;
+        renderRemap();
+        setStatus(`${prefix}: key capture cancelled`);
+        break;
+      }
+
+      if (idx === NAV_B) {
+        // B cancels a pending gamepad capture instead of binding.
+        remapListening = null;
+        captured = true;
+        renderRemap();
+        setStatus(`${prefix}: capture cancelled`);
+        break;
+      }
+
+      setRemapGamepad(id, idx);
+      const action = remapActions().find((a) => remapActionId(a) === id);
+      remapListening = null;
+      captured = true;
+      renderRemap();
+      setStatus(`${prefix}: ${remapActionLabel(action)} = ${formatPadButton(idx)}`);
+      break;
+    }
+  }
+
+  // Remap navigation (overlay open, not mid-capture): D-pad moves, A selects,
+  // B closes. `captured` stops a just-bound button from also moving focus.
+  if (overlayOpen && !remapListening && !captured && pads[remapPlayer]) {
+    const edge = (i) => nowPressed.has(`${remapPlayer}:${i}`) && !prevPadPressed.has(`${remapPlayer}:${i}`);
+    const up = edge(NAV_UP), down = edge(NAV_DOWN), left = edge(NAV_LEFT), right = edge(NAV_RIGHT);
+    const a = edge(NAV_A), b = edge(NAV_B);
+    if (up) remapNavigate(0, -1);
+    if (down) remapNavigate(0, 1);
+    if (left) remapNavigate(-1, 0);
+    if (right) remapNavigate(1, 0);
+    if (a) remapSelect();
+    else if (b) remapCancel();
+  }
+
+  // Pause menu navigation (paused): controller #1 D-pad moves, A selects,
+  // B resumes. Takes precedence over game input (which is frozen anyway).
+  const pauseMenuOpen = pauseOpen();
+  if (pauseMenuOpen && !captured && pads[0]) {
+    const edge = (i) => nowPressed.has(`0:${i}`) && !prevPadPressed.has(`0:${i}`);
+    const up = edge(NAV_UP), down = edge(NAV_DOWN), a = edge(NAV_A), b = edge(NAV_B);
+    if (up) pauseNavigate(-1);
+    else if (down) pauseNavigate(1);
+    if (a) pauseSelect();
+    else if (b) doResume();
+  }
+
+  // Library navigation (launcher open): controller #1 D-pad moves, A selects,
+  // B closes. Mutually exclusive with the remap overlay (only one is open).
+  if (libOpen && !pauseMenuOpen && !captured && pads[0]) {
+    const edge = (i) => nowPressed.has(`0:${i}`) && !prevPadPressed.has(`0:${i}`);
+    const up = edge(NAV_UP), down = edge(NAV_DOWN), left = edge(NAV_LEFT), right = edge(NAV_RIGHT);
+    const a = edge(NAV_A), b = edge(NAV_B);
+    if (up) libNavigate(0, -1);
+    else if (down) libNavigate(0, 1);
+    else if (left) libNavigate(-1, 0);
+    else if (right) libNavigate(1, 0);
+    if (a) libSelect();
+    else if (b) closeLibrary();
+  }
+
+  prevPadPressed.clear();
+  for (const k of nowPressed) prevPadPressed.add(k);
+  requestAnimationFrame(pollGamepads);
+}
+
+// ---- Control re-mapping overlay ----
+// One overlay serves two modes: 'player' remaps a player's GBA button bindings,
+// 'hotkeys' remaps the global turbo/save/load/pause actions. Both share the same
+// grid, navigation, and capture machinery; they differ only in the action list
+// and the binding store they read/write.
+let remapMode = 'player'; // 'player' | 'hotkeys'
+let remapPlayer = 0;
+let remapListening = null; // { id, source: 'keyboard' | 'gamepad' }
+
+// Gamepad UI navigation uses a FIXED set of standard buttons (never remapped,
+// since remapping targets game input, not the overlay UI): D-pad moves focus,
+// A selects, B closes.
+const NAV_UP = 12, NAV_DOWN = 13, NAV_LEFT = 14, NAV_RIGHT = 15, NAV_A = 0, NAV_B = 1;
+
+let remapNav = [];      // N rows x 2 cols of focusable elements (actions + footer)
+let remapFocus = { row: 0, col: 0 };
+
+// ---- Remap action abstraction (player vs hotkeys) ----
+function remapActions() {
+  return remapMode === 'hotkeys' ? HOTKEY_ACTIONS : REMAP_ACTIONS;
+}
+function remapActionId(action) {
+  return remapMode === 'hotkeys' ? action.id : action.bit;
+}
+function remapActionLabel(action) {
+  return remapMode === 'hotkeys' ? action.label : action.name;
+}
+// Current keyboard binding code (or null) for an action id.
+function remapKeyboardCode(id) {
+  if (remapMode === 'hotkeys') return hotkeys[id].keyboard || null;
+  const map = controls[remapPlayer].keyboard;
+  for (const code in map) if (map[code] === id) return code;
+  return null;
+}
+// Current gamepad button index (or null) for an action id.
+function remapGamepadIndex(id) {
+  if (remapMode === 'hotkeys') {
+    const g = hotkeys[id].gamepad;
+    return (g === null || g === undefined) ? null : g;
+  }
+  const map = controls[remapPlayer].gamepadButtons;
+  for (const idx in map) if (map[idx] === id) return parseInt(idx, 10);
+  return null;
+}
+// Bind a keyboard code to an action id (one key drives one action; replace).
+function setRemapKeyboard(id, code) {
+  if (remapMode === 'hotkeys') {
+    for (const k in hotkeys) if (hotkeys[k].keyboard === code) hotkeys[k].keyboard = null;
+    hotkeys[id].keyboard = code;
+    saveHotkeys();
+  } else {
+    const kb = controls[remapPlayer].keyboard;
+    for (const c in kb) if (c === code || kb[c] === id) delete kb[c];
+    kb[code] = id;
+    saveControls();
+  }
+}
+// Bind a gamepad button index to an action id (one button drives one action).
+function setRemapGamepad(id, idx) {
+  if (remapMode === 'hotkeys') {
+    for (const k in hotkeys) if (hotkeys[k].gamepad === idx) hotkeys[k].gamepad = null;
+    hotkeys[id].gamepad = idx;
+    saveHotkeys();
+  } else {
+    const gb = controls[remapPlayer].gamepadButtons;
+    for (const k in gb) if (parseInt(k, 10) === idx || gb[k] === id) delete gb[k];
+    gb[idx] = id;
+    saveControls();
+  }
+}
+
+function openRemap(p) {
+  remapMode = 'player';
+  remapPlayer = p;
+  remapListening = null;
+  remapFocus = { row: 0, col: 0 };
+  document.getElementById('remap-title').textContent = `Player ${p + 1} Controls`;
+  renderRemap();
+  document.getElementById('remap-overlay').hidden = false;
+  closeMenus();
+}
+
+function openHotkeysRemap() {
+  remapMode = 'hotkeys';
+  remapPlayer = 0; // global hotkeys: navigate/capture with controller #1
+  remapListening = null;
+  remapFocus = { row: 0, col: 0 };
+  document.getElementById('remap-title').textContent = 'Global Hotkeys';
+  renderRemap();
+  document.getElementById('remap-overlay').hidden = false;
+  closeMenus();
+}
+
+function remapOverlayOpen() {
+  const overlay = document.getElementById('remap-overlay');
+  return !!(overlay && !overlay.hidden);
+}
+
+function closeRemap() {
+  remapListening = null;
+  document.getElementById('remap-overlay').hidden = true;
+}
+
+function renderRemap() {
+  const rows = document.getElementById('remap-rows');
+  rows.innerHTML = '';
+  remapNav = [];
+  for (const action of remapActions()) {
+    const id = remapActionId(action);
+    const row = document.createElement('div');
+    row.className = 'remap-row';
+
+    const label = document.createElement('span');
+    label.className = 'remap-action';
+    label.textContent = remapActionLabel(action);
+
+    const kbCode = remapKeyboardCode(id);
+    const kbBtn = document.createElement('button');
+    kbBtn.className = 'remap-cell';
+    kbBtn.textContent = kbCode ? formatKeyCode(kbCode) : '\u2014';
+    kbBtn.addEventListener('click', () => beginListen(id, 'keyboard'));
+
+    const padIdx = remapGamepadIndex(id);
+    const padBtn = document.createElement('button');
+    padBtn.className = 'remap-cell';
+    padBtn.textContent = padIdx !== null ? formatPadButton(padIdx) : '\u2014';
+    padBtn.addEventListener('click', () => beginListen(id, 'gamepad'));
+
+    row.append(label, kbBtn, padBtn);
+    rows.appendChild(row);
+    remapNav.push([kbBtn, padBtn]);
+  }
+  // Footer: Reset (col 0) and Done (col 1) as the last "row".
+  remapNav.push([
+    document.getElementById('remap-reset'),
+    document.getElementById('remap-done'),
+  ]);
+  applyRemapFocus();
+  updateRemapHint();
+}
+
+function applyRemapFocus() {
+  document.querySelectorAll('#remap-overlay .focused').forEach((el) => el.classList.remove('focused'));
+  const row = remapNav[remapFocus.row];
+  const el = row ? row[remapFocus.col] : null;
+  if (el) {
+    el.classList.add('focused');
+    if (el.scrollIntoView) el.scrollIntoView({ block: 'nearest' });
+  }
+}
+
+function remapNavigate(dCol, dRow) {
+  const rows = remapNav.length || 1;
+  remapFocus.row = (remapFocus.row + dRow + rows) % rows;
+  if (dCol < 0) remapFocus.col = 0;
+  else if (dCol > 0) remapFocus.col = 1;
+  applyRemapFocus();
+}
+
+function remapSelect() {
+  const { row, col } = remapFocus;
+  if (row >= remapNav.length - 1) {
+    // Footer row: Reset / Done.
+    if (col === 0) resetRemapCurrent();
+    else closeRemap();
+    return;
+  }
+  const action = remapActions()[row];
+  beginListen(remapActionId(action), col === 0 ? 'keyboard' : 'gamepad');
+}
+
+function remapCancel() {
+  closeRemap();
+}
+
+function updateRemapHint() {
+  if (remapListening) return; // beginListen set a specific "press a button" hint.
+  document.getElementById('remap-hint').textContent =
+    'D-pad to move \u00b7 A to select \u00b7 B to close \u2014 or click a cell and press a key/button.';
+}
+
+function beginListen(id, source) {
+  document.querySelectorAll('.remap-cell.listening').forEach((c) => c.classList.remove('listening'));
+  remapListening = { id, source };
+  const hint = document.getElementById('remap-hint');
+  hint.textContent =
+    source === 'keyboard'
+      ? 'Press the key you want to bind\u2026 (any gamepad button cancels)'
+      : 'Press the gamepad button you want to bind\u2026 (B cancels)';
+  const actions = remapActions();
+  [...document.querySelectorAll('.remap-row')].forEach((row, i) => {
+    if (actions[i] && remapActionId(actions[i]) === id) {
+      row.children[source === 'keyboard' ? 1 : 2].classList.add('listening');
+    }
+  });
+}
+
+function remapCaptureKey(e) {
+  if (!remapListening || remapListening.source !== 'keyboard') return;
+  const id = remapListening.id;
+  setRemapKeyboard(id, e.code);
+  const action = remapActions().find((a) => remapActionId(a) === id);
+  remapListening = null;
+  renderRemap();
+  const prefix = remapMode === 'hotkeys' ? 'Hotkey' : `Player ${remapPlayer + 1}`;
+  setStatus(`${prefix}: ${remapActionLabel(action)} = ${formatKeyCode(e.code)}`);
+  e.preventDefault();
+}
+
+function resetRemapCurrent() {
+  if (remapMode === 'hotkeys') {
+    hotkeys = defaultHotkeys();
+    saveHotkeys();
+    setStatus('Hotkeys reset to defaults');
+  } else {
+    controls[remapPlayer] = defaultControlFor(remapPlayer);
+    saveControls();
+    setStatus(`Player ${remapPlayer + 1} controls reset to defaults`);
+  }
+  renderRemap();
+}
+
+// ---- Player count (1-4 linked instances) ----
+
+function highlightPlayersMenu(count) {
+  document.querySelectorAll('#player-menu button').forEach((btn) => {
+    if (!btn.dataset.players) return; // e.g. the Solo Keyboard toggle
+    btn.classList.toggle('active', parseInt(btn.dataset.players, 10) === count);
+  });
+}
+
+async function setPlayerCount(n) {
+  // Strict integer guard: NaN slips past the n<1/n>4 comparisons and would
+  // corrupt playerCount (reached via a non-player button in #player-menu).
+  if (!Number.isInteger(n) || n < 1 || n > 4) return;
+  if (wasmMode) {
+    dbInit(n);
+    playerCount = n;
+  } else if (IS_TAURI) {
+    await invoke('set_player_count', { n });
+    playerCount = await invoke('player_count');
+  }
+  resetRuntimeState();
+  initScreens(playerCount);
+  highlightPlayersMenu(playerCount);
+  setStatus(`${playerCount} linked player${playerCount > 1 ? 's' : ''} selected\u2014load a ROM`);
+}
+
+// ---- ROM loading ----
+
+async function pickRomTauri() {
+  closeMenus();
+  const { open } = window.__TAURI__.dialog;
+  const selected = await open({
+    multiple: false,
+    filters: [{ name: 'Game Boy / Game Boy Advance ROM', extensions: ROM_EXTENSIONS }],
+  });
+  if (selected) {
+    setStatus('Loading: ' + selected);
+    await invoke('load_rom', { path: selected });
+    setStatus('Running: ' + selected);
+    const base = selected.split(/[\\/]/).pop().replace(/\.[^.]+$/, '') || selected;
+    recordRecent(base, selected);
+  }
+  closeMenus();
+}
+
+function pickRomBrowser() {
+  closeMenus();
+  const input = document.createElement('input');
+  input.type = 'file';
+  input.accept = romAccept();
+  input.onchange = async () => {
+    const file = input.files[0];
+    if (!file) return;
+    const name = file.name.replace(/\.[^.]+$/, '');
+    setStatus('Loading: ' + file.name);
+    if (wasmMode) {
+      const bytes = new Uint8Array(await file.arrayBuffer());
+      const ok = wasmLoadRomBytes(bytes) === 0;
+      if (ok) resetRuntimeState();
+      setStatus(ok ? 'Running: ' + file.name : 'Error: ROM load failed');
+      let key = null;
+      if (ok) {
+        key = `rom_${name}`;
+        try { await cacheGameBytes(key, name, bytes); } catch (e) { key = null; }
+      }
+      recordRecent(name, null, null, key);
+      closeMenus();
+      return;
+    }
+    const resp = await fetch('/load_rom', { method: 'POST', body: file });
+    if (resp.ok) resetRuntimeState();
+    if (resp.ok) setStatus('Running: ' + file.name);
+    else setStatus('Error: ' + (await resp.text()));
+    let key = null;
+    if (resp.ok) {
+      key = `rom_${name}`;
+      try { await cacheGameBytes(key, name, new Uint8Array(await file.arrayBuffer())); } catch (e) { key = null; }
+    }
+    recordRecent(name, null, null, key);
+    closeMenus();
+  };
+  input.click();
+}
+
+// ---- Save import/export ----
+
+async function exportSaveTauri(player) {
+  const { save } = window.__TAURI__.dialog;
+  // The battery save is plain SRAM/flash bytes: mGBA names it .sav, RetroArch
+  // names the identical data .srm — accept both so per-core saves move in
+  // both directions without renaming (issue #2).
+  const path = await save({
+    filters: [{ name: 'GBA Save', extensions: ['sav', 'srm'] }],
+    defaultPath: `player${player}.sav`,
+  });
+  if (path) {
+    await invoke('export_save', { player, path });
+    setStatus(`Saved player ${player} save to ${path}`);
+  }
+}
+
+// In-browser battery save: unlike the desktop socket path there is no HTTP
+// server to POST to (GitHub Pages answers 405 — issue #2), so when the WASM
+// engine is in charge we hand the bytes to the core directly (same core
+// vtable primitives as the desktop wrapper: savedataClone/savedataRestore).
+function wasmSaveApi() {
+  const M = wasmModule;
+  if (!M || !M._mgs_export_save || !M._mgs_save_ptr || !M._mgs_import_save) return null;
+  return M;
+}
+
+async function exportSaveBrowser(player) {
+  const M = wasmSaveApi();
+  if (M) {
+    const size = M._mgs_export_save(player - 1);
+    if (!size) {
+      setStatus('Error: no save data (game has no battery-backed save?)');
+      return;
+    }
+    const bytes = M.HEAPU8.slice(M._mgs_save_ptr(), M._mgs_save_ptr() + size);
+    const url = URL.createObjectURL(new Blob([bytes], { type: 'application/octet-stream' }));
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `player${player}.sav`;
+    a.click();
+    URL.revokeObjectURL(url);
+    setStatus(`Downloaded player ${player} save`);
+    return;
+  }
+  const resp = await fetch(`/save/${player}`);
+  if (!resp.ok) {
+    setStatus('Error: ' + (await resp.text()));
+    return;
+  }
+  const url = URL.createObjectURL(await resp.blob());
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = `player${player}.sav`;
+  a.click();
+  URL.revokeObjectURL(url);
+  setStatus(`Downloaded player ${player} save`);
+}
+
+async function importSaveTauri(player) {
+  const { open } = window.__TAURI__.dialog;
+  const selected = await open({
+    multiple: false,
+    // Battery saves carry the same bytes under several names (.sav, RetroArch
+    // .srm) — see issue #2.
+    filters: [{ name: 'GBA Save', extensions: ['sav', 'srm'] }],
+  });
+  if (selected) {
+    await invoke('import_save', { player, path: selected });
+    setStatus(`Imported save into player ${player}`);
+  }
+}
+
+function importSaveBrowser(player) {
+  const input = document.createElement('input');
+  input.type = 'file';
+  // .sav (mGBA) and .srm (RetroArch core saves) are byte-identical for GBA
+  // games; .sa1-.sa4 are mGBA's per-slot variants of the same data.
+  input.accept = '.sav,.srm,.sa1,.sa2,.sa3,.sa4';
+  input.onchange = async () => {
+    const file = input.files[0];
+    if (!file) return;
+    const M = wasmSaveApi();
+    if (M) {
+      const blob = new Uint8Array(await file.arrayBuffer());
+      const ptr = M._malloc(blob.length);
+      try {
+        M.HEAPU8.set(blob, ptr);
+        const rc = M._mgs_import_save(player - 1, ptr, blob.length);
+        if (rc === 0) {
+          setStatus(`Imported ${file.name} into player ${player}`);
+        } else {
+          setStatus(`Error: could not load ${file.name} into player ${player} (rc ${rc})`);
+        }
+      } finally {
+        M._free(ptr);
+      }
+      return;
+    }
+    const resp = await fetch(`/save/${player}`, { method: 'POST', body: file });
+    setStatus(resp.ok ? `Imported save into player ${player}` : 'Error: ' + (await resp.text()));
+  };
+  input.click();
+}
+
+async function exportSetTauri() {
+  closeMenus();
+  const { save } = window.__TAURI__.dialog;
+  const path = await save({
+    filters: [{ name: 'mgba-splitscreen Save Set', extensions: ['dualbysave'] }],
+    defaultPath: 'mgba-splitscreen.dualbysave',
+  });
+  if (path) {
+    await invoke('export_save_set', { path });
+    setStatus(`Saved all saves to ${path}`);
+  }
+  closeMenus();
+}
+
+async function exportSetBrowser() {
+  closeMenus();
+  const resp = await fetch('/save_set');
+  if (!resp.ok) {
+    setStatus('Error: ' + (await resp.text()));
+    return;
+  }
+  const url = URL.createObjectURL(await resp.blob());
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = 'mgba-splitscreen.dualbysave';
+  a.click();
+  URL.revokeObjectURL(url);
+  setStatus('Downloaded save set');
+}
+
+async function importSetTauri() {
+  closeMenus();
+  const { open } = window.__TAURI__.dialog;
+  const selected = await open({
+    multiple: false,
+    filters: [{ name: 'mgba-splitscreen Save Set', extensions: ['dualbysave'] }],
+  });
+  if (selected) {
+    await invoke('import_save_set', { path: selected });
+    setStatus('Imported save set');
+  }
+  closeMenus();
+}
+
+function importSetBrowser() {
+  closeMenus();
+  const input = document.createElement('input');
+  input.type = 'file';
+  input.accept = '.dualbysave';
+  input.onchange = async () => {
+    const file = input.files[0];
+    if (!file) return;
+    const resp = await fetch('/save_set', { method: 'POST', body: file });
+    setStatus(resp.ok ? 'Imported save set' : 'Error: ' + (await resp.text()));
+  };
+  input.click();
+}
+
+// ---- Save-state set export/import ----
+// Format: b"DUALSTATE" | version:u32 LE (1) | count:u32 LE | (size:u32 LE, bytes)*
+// Same container as the backend's serialize_state_set, so a state captured in
+// the browser (wasm mode) can be restored by the web server (socket mode) and
+// vice versa. Each per-player blob is an mGBA core save state.
+const STATE_SET_MAGIC = 'DUALSTATE';
+
+function serializeStateSet(states) {
+  const enc = new TextEncoder();
+  let total = 9 + 8 + states.reduce((a, s) => a + 4 + s.length, 0);
+  const out = new Uint8Array(total);
+  out.set(enc.encode(STATE_SET_MAGIC), 0);
+  const dv = new DataView(out.buffer);
+  let off = 9;
+  dv.setUint32(off, 1, true); off += 4; // version
+  dv.setUint32(off, states.length, true); off += 4;
+  for (const s of states) {
+    dv.setUint32(off, s.length, true); off += 4;
+    out.set(s, off);
+    off += s.length;
+  }
+  return out;
+}
+
+function deserializeStateSet(bytes) {
+  const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  if (new TextDecoder().decode(bytes.subarray(0, 9)) !== STATE_SET_MAGIC) {
+    throw new Error('Not a mgba-splitscreen state set');
+  }
+  if (dv.getUint32(9, true) !== 1) throw new Error('Unsupported state set version');
+  const count = dv.getUint32(13, true);
+  const states = [];
+  let off = 17;
+  for (let i = 0; i < count; i++) {
+    const size = dv.getUint32(off, true); off += 4;
+    if (off + size > bytes.length) throw new Error('Truncated state set');
+    states.push(bytes.slice(off, off + size));
+    off += size;
+  }
+  return states;
+}
+
+function downloadBlob(bytes, filename) {
+  const url = URL.createObjectURL(new Blob([bytes]));
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  a.click();
+  URL.revokeObjectURL(url);
+}
+
+function wasmCurrentStates() {
+  // wasm mode: wasmStates holds per-player blobs from the last Quick Save.
+  if (!wasmStates.length) return null;
+  return serializeStateSet(wasmStates);
+}
+
+async function exportStateTauri() {
+  closeMenus();
+  const { save } = window.__TAURI__.dialog;
+  const path = await save({
+    // Legacy '.dualbystate' stays accepted so sets exported before the rename
+    // still load; new exports use the product-derived extension.
+    filters: [{ name: 'mgba-splitscreen State Set', extensions: ['mgsstate', 'dualbystate'] }],
+    defaultPath: 'mgba-splitscreen.mgsstate',
+  });
+  if (path) {
+    await invoke('export_state_set', { path });
+    setStatus(`Saved state set to ${path}`);
+  }
+  closeMenus();
+}
+
+async function importStateTauri() {
+  closeMenus();
+  const { open } = window.__TAURI__.dialog;
+  const selected = await open({
+    multiple: false,
+    filters: [{ name: 'mgba-splitscreen State Set', extensions: ['mgsstate', 'dualbystate'] }],
+  });
+  if (selected) {
+    await invoke('import_state_set', { path: selected });
+    setStatus('Imported state set');
+  }
+  closeMenus();
+}
+
+async function exportStateBrowser() {
+  closeMenus();
+  if (wasmMode) {
+    const blob = wasmCurrentStates();
+    if (!blob) { setStatus('No quick state to export (F5 to save first)'); return; }
+    downloadBlob(blob, 'mgba-splitscreen.mgsstate');
+    setStatus(`Downloaded state set (${wasmStates.length} players)`);
+    return;
+  }
+  const resp = await fetch('/state');
+  if (!resp.ok) { setStatus('Error: ' + (await resp.text())); return; }
+  downloadBlob(await resp.blob(), 'mgba-splitscreen.mgsstate');
+  setStatus('Downloaded state set');
+}
+
+function importStateBrowser() {
+  closeMenus();
+  const input = document.createElement('input');
+  input.type = 'file';
+  input.accept = '.mgsstate,.dualbystate';
+  input.onchange = async () => {
+    const file = input.files[0];
+    if (!file) return;
+    const bytes = new Uint8Array(await file.arrayBuffer());
+    if (wasmMode) {
+      try {
+        const states = deserializeStateSet(bytes);
+        if (!states.length) throw new Error('Empty state set');
+        const M = wasmModule;
+        let ok = true;
+        for (let i = 0; i < Math.min(playerCount, states.length); i++) {
+          const ptr = M._malloc(states[i].length);
+          if (!ptr) { ok = false; break; }
+          M.HEAPU8.set(states[i], ptr);
+          const rc = M._mgs_load_state_bytes(i, ptr, states[i].length);
+          M._free(ptr);
+          if (rc !== 0) { ok = false; break; }
+        }
+        // Mirror the desktop wrapper: reset the link drivers after restoring
+        // states so stale mid-link queues/asleep flags can't corrupt the
+        // re-handshake (see mgs_reset_sio in mgba_splitscreen_web.c).
+        if (ok) M._mgs_reset_sio();
+        setStatus(ok ? `Imported state set (${states.length} players)` : 'Load state failed');
+      } catch (err) {
+        setStatus('Import failed: ' + err.message);
+      }
+      return;
+    }
+    const resp = await fetch('/state', { method: 'POST', body: bytes });
+    setStatus(resp.ok ? 'Imported state set' : 'Error: ' + (await resp.text()));
+  };
+  input.click();
+}
+
+// ---- Browser audio (WebAudio playback) ----
+// The web server streams the selected mix (Player 1 / mix all / etc.) as tagged
+// binary frames: u32 LE sample rate + interleaved stereo s16. The desktop app
+// plays via ALSA instead, so this path only runs in the browser (!IS_TAURI).
+
+let audioCtx = null;
+let audioNode = null;
+let audioBuf = new Float32Array(0); // interleaved L,R awaiting playback
+let audioSrcRate = 32768;
+let audioPos = 0; // fractional sample-frame read position within audioBuf
+// Cheap health telemetry for the audioStateRef probe (and crash reports):
+// chunks delivered into the resampler and the loudest recent sample. A silent
+// game with pumped>0 and peak==0 points at the engine; pumped==0 points at
+// the pump/unlock path.
+const audioStats = { pumped: 0, peak: 0, lastBytes: 0 };
+
+function unlockAudio() {
+  if (IS_TAURI) return; // desktop: ALSA handles audio, not WebAudio
+  if (audioCtx) {
+    if (audioCtx.state === 'suspended') audioCtx.resume().catch(() => {});
+    return;
+  }
+  // A tab that received audio before its first gesture (an online guest, or
+  // any background tab the pump kept feeding) holds seconds of stale backlog;
+  // drop it so unlocking doesn't replay old audio.
+  if (audioBuf.length > audioSrcRate) {
+    audioBuf = new Float32Array(0);
+    audioPos = 0;
+  }
+  try {
+    const Ctx = window.AudioContext || window.webkitAudioContext;
+    if (!Ctx) return;
+    audioCtx = new Ctx();
+  } catch {
+    return;
+  }
+  // ScriptProcessorNode is deprecated but universally supported and simple;
+  // AudioWorklet + a SharedArrayBuffer ring is the modern upgrade path. 2048
+  // samples (~46ms) keeps latency low without underrunning on the main thread.
+  audioNode = audioCtx.createScriptProcessor(2048, 0, 2);
+  audioNode.onaudioprocess = onAudioProcess;
+  audioNode.connect(audioCtx.destination);
+}
+
+// Catmull-Rom cubic interpolation between p1 and p2 (neighbors p0, p3).
+// Same as what a decent audio resampler uses; much flatter passband than linear.
+function cubicInterp(p0, p1, p2, p3, t) {
+  const t2 = t * t;
+  const t3 = t2 * t;
+  return 0.5 * (2 * p1 + (-p0 + p2) * t + (2 * p0 - 5 * p1 + 4 * p2 - p3) * t2 + (-p0 + 3 * p1 - 3 * p2 + p3) * t3);
+}
+
+function onAudioProcess(e) {
+  const outL = e.outputBuffer.getChannelData(0);
+  const outR = e.outputBuffer.getChannelData(1);
+  const n = outL.length;
+  const frames = audioBuf.length >> 1;
+  if (frames < 4) {
+    // Not enough history for cubic (startup/underrun): output silence.
+    outL.fill(0);
+    outR.fill(0);
+    audioPos = 0;
+    return;
+  }
+  // Resample the GBA rate (32768/65536) to the AudioContext rate with 4-tap
+  // cubic interpolation. The GBA's native output is 8-bit-ish PCM, so the
+  // resampler is the only quality-sensitive stage in this whole path.
+  const ratio = audioSrcRate / audioCtx.sampleRate;
+  for (let i = 0; i < n; i++) {
+    const k = audioPos | 0;
+    const frac = audioPos - k;
+    if (k < 1 || k > frames - 3) {
+      outL[i] = 0;
+      outR[i] = 0;
+    } else {
+      const k0 = (k - 1) * 2;
+      const k1 = k * 2;
+      const k2 = (k + 1) * 2;
+      const k3 = (k + 2) * 2;
+      outL[i] = cubicInterp(audioBuf[k0], audioBuf[k1], audioBuf[k2], audioBuf[k3], frac);
+      outR[i] = cubicInterp(audioBuf[k0 + 1], audioBuf[k1 + 1], audioBuf[k2 + 1], audioBuf[k3 + 1], frac);
+    }
+    audioPos += ratio;
+  }
+  // Discard fully-consumed frames so the queue can't grow unbounded.
+  const consumed = audioPos | 0;
+  if (consumed > 0) {
+    audioBuf = audioBuf.subarray(consumed * 2);
+    audioPos -= consumed;
+  }
+}
+
+function onAudio(data) {
+  // Both call sites must agree on a TypedArray: the socket path passes a
+  // Uint8Array view (tag stripped), while the wasm path used to pass a raw
+  // ArrayBuffer -- which made `new DataView(data.buffer, ...)` throw "First
+  // argument to DataView constructor must be an ArrayBuffer" on EVERY frame
+  // (silent sound + a 60/s uncaught-exception console flood that can starve
+  // the frame loop). Normalize so either input works.
+  if (!(data instanceof Uint8Array)) {
+    data = new Uint8Array(data);
+  }
+  if (data.byteLength < 4) return;
+  const dv = new DataView(data.buffer, data.byteOffset, data.byteLength);
+  const rate = dv.getUint32(0, true);
+  const count = (data.byteLength - 4) >> 1;
+  if (count <= 0) return;
+  if (rate !== audioSrcRate) {
+    // Rate changed (SOUNDBIAS resolution switch): flush and restart at new rate.
+    audioBuf = new Float32Array(0);
+    audioPos = 0;
+    audioSrcRate = rate;
+  }
+  // Copy the sample bytes: the 1-byte tag makes the absolute offset odd, which
+  // Int16Array rejects (needs 2-byte alignment). slice() returns a fresh,
+  // zero-offset, aligned buffer.
+  const sampleBytes = data.slice(4);
+  const src = new Int16Array(sampleBytes.buffer, sampleBytes.byteOffset, count);
+  const flt = new Float32Array(count);
+  let peak = 0;
+  for (let i = 0; i < count; i++) {
+    const v = src[i] / 32768;
+    flt[i] = v;
+    const a = v < 0 ? -v : v;
+    if (a > peak) peak = a;
+  }
+  audioStats.pumped++;
+  audioStats.lastBytes = data.byteLength;
+  audioStats.peak = Math.max(audioStats.peak * 0.95, peak); // decaying so it self-clears
+  const merged = new Float32Array(audioBuf.length + flt.length);
+  merged.set(audioBuf, 0);
+  merged.set(flt, audioBuf.length);
+  // Cap the pending buffer so a stalled consumer can't balloon memory. Hosts
+  // keep ~4s (latency is irrelevant for local playback; head drop with the
+  // read position adjusted, as before). Online guests keep only ~500ms and
+  // drop the OLDEST audio when over the cap: a phone on a slow link that falls
+  // behind must hear recent audio, not an ever-growing stale backlog (the
+  // old unbounded growth played back overlapping, garbled sound).
+  const guestAudio = !!window.mgbaOnline?.isGuest?.();
+  const max = (guestAudio ? audioSrcRate / 2 : audioSrcRate * 4) * 2;
+  if (merged.length > max) {
+    if (guestAudio) {
+      audioBuf = merged.subarray(merged.length - max);
+      audioPos = 0; // the past is gone; read the kept (recent) samples from the start
+    } else {
+      const dropped = merged.length - max;
+      audioBuf = merged.subarray(dropped);
+      audioPos = Math.max(0, audioPos - (dropped >> 1));
+    }
+  } else {
+    audioBuf = merged;
+  }
+}
+
+// ---- In-browser engine (WASM) ----
+
+// The emscripten output only exposes `MgbaSplitScreenWasm` as a plain global (its
+// export guards target CommonJS/AMD, which browsers don't provide), so load it
+// as a classic script and grab the factory it declares.
+function loadWasmModule() {
+  return new Promise((resolve, reject) => {
+    if (window.MgbaSplitScreenWasm) { resolve(window.MgbaSplitScreenWasm); return; }
+    const s = document.createElement('script');
+    s.src = new URL('mgba-splitscreen-web.js', location.href).href;
+    s.onload = () => resolve(window.MgbaSplitScreenWasm);
+    s.onerror = () => reject(new Error('failed to load mgba-splitscreen-web.js'));
+    document.head.appendChild(s);
+  }).then(async (factory) => {
+    wasmModule = await factory({
+      locateFile: (path) => new URL('mgba-splitscreen-web.wasm', location.href).href,
+      // The emscripten runtime calls this for unrecoverable engine failures
+      // (OOM, assertions, WASM traps) that never surface as JS exceptions.
+      onAbort: (reason) => {
+        wasmMode = false;
+        try { document.getElementById('hosted-note').hidden = false; } catch (_) {}
+        setStatus('Engine crashed: ' + (reason || 'unknown cause'));
+        window.mgbaCrash?.reportEngineAbort?.(reason);
+      },
+    });
+    return wasmModule;
+  });
+}
+
+// Push a ROM's bytes into every linked core. Returns 0 on success.
+function wasmLoadRomBytes(bytes) {
+  const M = wasmModule;
+  const ptr = M._malloc(bytes.length);
+  if (!ptr) return -99;
+  M.HEAPU8.set(bytes, ptr);
+  const rc = M._mgs_load_rom(ptr, bytes.length);
+  M._free(ptr);
+  return rc;
+}
+
+// Drain the audio buffer without playing (mute, turbo exit). Must actually
+// call the drain: _mgs_get_audio() empties the cores' audio buffers, while
+// _mgs_audio_frames() only reports what the PREVIOUS drain collected. The old
+// no-op left ~2 s of backlog that kept playing after mute/turbo exited.
+function wasmFlushAudio() {
+  if (!wasmModule) return;
+  wasmModule._mgs_get_audio();
+  wasmModule._mgs_audio_frames();
+}
+
+// Copy every player's latest finished frame into the canvases.
+function wasmRenderVideo() {
+  const M = wasmModule;
+  const heap = M.HEAPU8;
+  for (let i = 0; i < playerCount; i++) {
+      const ptr = M._mgs_get_video(i);
+    if (!ptr) continue;
+    const width = M._mgs_get_video_width ? M._mgs_get_video_width(i) : GBA_WIDTH;
+    const height = M._mgs_get_video_height ? M._mgs_get_video_height(i) : GBA_HEIGHT;
+    const screen = screens[i];
+    if (width > 0 && height > 0 && (screen.width !== width || screen.height !== height)) {
+      screen.width = width;
+      screen.height = height;
+      screen.canvas.width = width;
+      screen.canvas.height = height;
+      screen.imgData = screen.ctx.createImageData(width, height);
+    }
+    const size = screen.width * screen.height * 4;
+    screen.imgData.data.set(heap.subarray(ptr, ptr + size));
+    screen.ctx.putImageData(screen.imgData, 0, 0);
+  }
+}
+
+// Feed this frame's mixed audio into the existing WebAudio resampler, tagged
+// the same way the backend streams it (u32 LE rate + interleaved stereo s16).
+// Online hosts MUST pump even with no local audioCtx (guests need the stream
+// even when the host hasn't clicked to unlock sound yet) and during turbo
+// (guests hear normal-speed game audio while the host fast-forwards).
+function wasmPumpAudio() {
+  const M = wasmModule;
+  if (!M || !M._mgs_get_audio || !M._mgs_audio_frames) return;
+  const hostBroadcasting = !!window.mgbaOnline?.isHost?.();
+  if (!audioCtx && !hostBroadcasting) return;
+  // Drain FIRST: _mgs_audio_frames() reports what the PREVIOUS _mgs_get_audio
+  // call collected (the C side sets the count inside the drain itself), so the
+  // old frames-first ordering read 0 on every single call and the in-browser
+  // engine was silent no matter which Audio source was picked.
+  const ptr = M._mgs_get_audio();
+  const frames = M._mgs_audio_frames();
+  if (frames <= 0 || !ptr) return;
+  const sampleBytes = M.HEAPU8.subarray(ptr, ptr + frames * 4);
+  const tagged = new Uint8Array(4 + sampleBytes.length);
+  const rate = M._mgs_get_audio_rate ? M._mgs_get_audio_rate() : 32768;
+  new DataView(tagged.buffer).setUint32(0, rate, true);
+  tagged.set(sampleBytes, 4);
+  // Guests-first: the host's own playback stays optional (muted host,
+  // pre-gesture host, turbo host), but the guest stream must always flow.
+  if (hostBroadcasting) window.mgbaOnline.broadcastAudio(tagged);
+  if (audioCtx) onAudio(tagged);
+}
+
+// Fixed-timestep 60 fps loop. At 60 Hz displays one frame runs per rAF; on
+// 120/144 Hz panels the accumulator throttles to exactly 60 game-fps. Turbo
+// runs as many frames per rAF as the browser can chew, with audio muted.
+function wasmFrame(now) {
+  wasmLoopId = requestAnimationFrame(wasmFrame);
+  const M = wasmModule;
+  let delta = now - wasmLast;
+  wasmLast = now;
+  if (delta > 100) delta = 100; // tab hidden: don't spiral the accumulator
+  if (turboOn) {
+    const TURBO_FRAMES = 4; // ~4x at 60 Hz rAF; adjust for stronger fast-forward
+    for (let i = 0; i < TURBO_FRAMES; i++) {
+      if (paused) break;
+      M._mgs_run_frame();
+    }
+  } else {
+    // Fixed-timestep 60 fps: the accumulator tracks real time and each pass
+    // runs as many game frames as are owed. A heavy frame (link handshakes,
+    // DMA bursts) simply delays the display; game time is NEVER dropped — the
+    // old `wasmAccum = 0` reset below threw away up to 4 frames of progress
+    // whenever the tab fell behind, making slowdowns permanent instead of
+    // transient. The ran<6 cap only bounds a single rAF's catch-up work; the
+    // accumulator clamp is belt-and-suspenders after a long stall.
+    wasmAccum += delta;
+    let ran = 0;
+    while (wasmAccum >= FRAME_MS && ran < 6) {
+      if (!paused) M._mgs_run_frame();
+      wasmAccum -= FRAME_MS;
+      ran++;
+    }
+    if (wasmAccum > FRAME_MS * 6) wasmAccum = FRAME_MS * 6;
+  }
+  wasmRenderVideo();
+  // Online hosts forward ONLY each guest's own seat: broadcastFrame takes a
+  // seat->pixels provider so we hand it live views into the screens' ImageData
+  // with zero copies, and online.js JPEG-encodes per connection at a capped
+  // fps. (The old path reassembled ALL players' raw RGBA into one ~300KB
+  // message per frame — ~18MB/s through a reliable DataChannel, which stalled
+  // to a few fps and left guests minutes behind.)
+  // Audio forwarding happens in wasmPumpAudio (also called during turbo).
+  if (window.mgbaOnline?.isHost?.()) {
+    window.mgbaOnline.broadcastFrame((seat) => {
+      const s = screens[seat];
+      return s && s.imgData ? s.imgData.data : null;
+    });
+  }
+  // Pump audio every frame: hosts broadcast to guests even in turbo (their
+  // own playback is skipped inside wasmPumpAudio while turbo is on).
+  wasmPumpAudio();
+}
+
+function wasmStartLoop() {
+  if (wasmLoopId || !wasmModule) return;
+  wasmLast = performance.now();
+  wasmAccum = 0;
+  wasmLoopId = requestAnimationFrame(wasmFrame);
+}
+
+function wasmStopLoop() {
+  if (wasmLoopId) {
+    cancelAnimationFrame(wasmLoopId);
+    wasmLoopId = 0;
+  }
+}
+
+// ---- WebSocket (desktop only: streams video/audio frames from the Rust
+// backend on 127.0.0.1:8088). Online browser sessions use the optional
+// PeerJS host-star layer in online.js instead. ----
+
+function connectWebSocket() {
+  // Desktop-only: the Tauri backend streams frames over this WebSocket.
+  const url = 'ws://127.0.0.1:8088';
+  socket = new WebSocket(url);
+  socket.binaryType = 'arraybuffer';
+  socket.onmessage = (event) => {
+    // Text frames are backend status/overlay lines. Binary frames are tagged:
+    // 0 = video (RGBA, all players concatenated), 1 = audio (rate + stereo s16).
+    if (typeof event.data === 'string') { pushOverlay(event.data); return; }
+    const bytes = new Uint8Array(event.data);
+    if (bytes[0] === 0) onFrame(bytes.subarray(1));
+    else if (bytes[0] === 1) onAudio(bytes.subarray(1));
+  };
+  socket.onclose = () => setTimeout(connectWebSocket, 1000);
+}
+
+window.addEventListener('DOMContentLoaded', async () => {
+  // Expose live engine/session state to crash-report.js (declared `let`s are
+  // module-scoped, so hand it read-only getters instead of copies).
+  try {
+    Object.defineProperty(window, 'wasmModeRef', { configurable: true, get: () => wasmMode });
+    Object.defineProperty(window, 'wasmModuleRef', { configurable: true, get: () => wasmModule });
+    Object.defineProperty(window, 'playerCountRef', { configurable: true, get: () => playerCount });
+    Object.defineProperty(window, 'audioStateRef', {
+      configurable: true,
+      get: () => ({
+        ctxState: audioCtx ? audioCtx.state : null,
+        node: !!audioNode,
+        buffered: audioBuf.length,
+        srcRate: audioSrcRate,
+        pumped: audioStats.pumped,
+        peak: +audioStats.peak.toFixed(3),
+      }),
+    });
+    window.sessionLogRef = sessionLog;
+  } catch (_) {}
+  if (!IS_TAURI && 'serviceWorker' in navigator) {
+    navigator.serviceWorker.register('sw.js').catch(() => {});
+  }
+  const joiningOnline = onlineJoinRequested();
+  if (IS_TAURI) {
+    try {
+      playerCount = await invoke('player_count');
+    } catch {
+      playerCount = 2;
+    }
+  } else if (joiningOnline) {
+    // Guests render the host's authoritative frames and do not create a local
+    // emulator. Their controls are forwarded over the PeerJS data channel.
+    wasmMode = false;
+    playerCount = requestedPlayerCount() || 2;
+    setStatus('Joining online session…');
+  } else {
+    // Browser builds are always fully client-side: the WASM core is the only
+    // engine. No backend is expected (GitHub Pages / static hosting), so we go
+    // straight to it instead of probing for a server.
+    // ?players=N chooses how many linked cores to create before the engine
+    // boots (the desktop app takes its count from the backend instead).
+    playerCount = requestedPlayerCount() || 2;
+    wasmMode = true;
+    try {
+      await loadWasmModule();
+      dbInit(playerCount);
+      setStatus(playerCount === 1
+        ? 'In-browser engine ready \u2014 1 GBA (load a ROM)'
+        : `In-browser engine ready \u2014 ${playerCount} linked GBAs (load a ROM)`);
+    } catch (err) {
+      // Engine failed: only now show the hosted-shell notice.
+      wasmMode = false;
+      document.getElementById('hosted-note').hidden = false;
+      setStatus('Engine failed to start: ' + err);
+    }
+  }
+  loadControls();
+  loadHotkeys();
+  refreshHotkeyLabels();
+  loadUiHide();
+  loadDebugToggle();
+  loadViewPrefs();
+  loadOutlinesPref();
+  loadBackground();
+  loadRecents();
+  loadLibrary();
+  initScreens(playerCount);
+  highlightPlayersMenu(playerCount);
+
+  document.querySelectorAll('#controls-menu [data-remap]').forEach((btn) => {
+    btn.addEventListener('click', () => openRemap(parseInt(btn.dataset.remap, 10)));
+  });
+  document.getElementById('remap-hotkeys').addEventListener('click', () => {
+    closeMenus();
+    openHotkeysRemap();
+  });
+  document.getElementById('remap-reset').addEventListener('click', resetRemapCurrent);
+  document.getElementById('remap-done').addEventListener('click', closeRemap);
+  document.getElementById('remap-overlay').addEventListener('click', (e) => {
+    if (e.target.id === 'remap-overlay') closeRemap(); // click outside the panel
+  });
+
+  document.getElementById('open-library').addEventListener('click', openLibrary);
+  document.getElementById('library-add-folder').addEventListener('click', addFolder);
+  document.getElementById('library-load-rom').addEventListener('click', () => {
+    closeLibrary();
+    IS_TAURI ? pickRomTauri() : pickRomBrowser();
+  });
+  document.getElementById('library-close').addEventListener('click', closeLibrary);
+  document.getElementById('library-overlay').addEventListener('click', (e) => {
+    if (e.target.id === 'library-overlay') closeLibrary(); // click outside the panel
+  });
+
+  document.querySelectorAll('#player-menu button').forEach((btn) => {
+    if (!btn.dataset.players) return; // e.g. the Solo Keyboard toggle
+    btn.addEventListener('click', () => {
+      closeMenus();
+      setPlayerCount(parseInt(btn.dataset.players, 10));
+    });
+  });
+
+  document.getElementById('load-rom').addEventListener('click', () =>
+    IS_TAURI ? pickRomTauri() : pickRomBrowser());
+  document.getElementById('quit-game').addEventListener('click', quitGame);
+  document.getElementById('quick-save-state').addEventListener('click', quickSaveState);
+  document.getElementById('quick-load-state').addEventListener('click', quickLoadState);
+  document.getElementById('toggle-turbo').addEventListener('click', () => {
+    closeMenus();
+    toggleTurbo();
+  });
+  document.getElementById('toggle-pause').addEventListener('click', () => {
+    closeMenus();
+    togglePause();
+  });
+  document.getElementById('toggle-debug').addEventListener('click', () => {
+    closeMenus();
+    toggleDebug();
+  });
+  document.getElementById('report-issue-menu').addEventListener('click', () => {
+    closeMenus();
+    if (window.mgbaCrash?.manualReport) window.mgbaCrash.manualReport();
+    else setStatus('Issue reporter unavailable in this build.');
+  });
+  document.querySelectorAll('#view-menu [data-view]').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      closeMenus();
+      setViewMode(btn.dataset.view);
+    });
+  });
+  document.getElementById('cycle-view').addEventListener('click', () => {
+    closeMenus();
+    cycleViewMode();
+  });
+  document.getElementById('cycle-focus').addEventListener('click', () => {
+    closeMenus();
+    cycleFocusPlayer();
+  });
+  document.getElementById('bg-image').addEventListener('click', pickBackground);
+  document.getElementById('bg-clear').addEventListener('click', clearBackground);
+  document.getElementById('toggle-outlines').addEventListener('click', () => {
+    closeMenus();
+    toggleOutlines();
+  });
+  document.getElementById('toggle-touch').addEventListener('click', () => {
+    closeMenus();
+    if (window.mgbaTouch) window.mgbaTouch.cycleMode();
+  });
+  document.getElementById('toggle-ui-hide').addEventListener('click', () => {
+    closeMenus();
+    toggleUiHide();
+  });
+  document.querySelectorAll('#audio-menu button').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      closeMenus();
+      setAudioSource(parseInt(btn.dataset.audio, 10));
+    });
+  });
+  highlightAudio(audioSource);
+  document.getElementById('export-set').addEventListener('click', () =>
+    IS_TAURI ? exportSetTauri() : exportSetBrowser());
+  document.getElementById('import-set').addEventListener('click', () =>
+    IS_TAURI ? importSetTauri() : importSetBrowser());
+  document.getElementById('export-state').addEventListener('click', () =>
+    IS_TAURI ? exportStateTauri() : exportStateBrowser());
+  document.getElementById('import-state').addEventListener('click', () =>
+    IS_TAURI ? importStateTauri() : importStateBrowser());
+  document.getElementById('toggle-solo').addEventListener('click', toggleSoloKeyboard);
+  // Keep both hosting modes wired independently. The normal host creates
+  // screen-sharing invites; the controller host creates input-only invites.
+  // Null-guard these newer controls so a stale cached shell cannot break boot.
+  const hostOnlineBtn = document.getElementById('online-host');
+  if (hostOnlineBtn) hostOnlineBtn.addEventListener('click', () => {
+    closeMenus();
+    startOnlineHost(false);
+  });
+  const hostPadBtn = document.getElementById('online-host-pad');
+  if (hostPadBtn) hostPadBtn.addEventListener('click', () => {
+    closeMenus();
+    startOnlineHost(true);
+  });
+  document.getElementById('online-slot').addEventListener('change', (event) => {
+    selectOnlineSlot(event.target.value);
+  });
+  document.getElementById('online-copy-invite').addEventListener('click', () => {
+    closeMenus();
+    copyOnlineInvite();
+  });
+  document.getElementById('online-copy-all').addEventListener('click', () => {
+    closeMenus();
+    copyAllOnlineInvites();
+  });
+  document.getElementById('online-show-qr').addEventListener('click', () => {
+    closeMenus();
+    openOnlineQr();
+  });
+  document.getElementById('online-share').addEventListener('click', () => {
+    closeMenus();
+    shareOnlineInvite();
+  });
+  document.getElementById('online-qr-copy').addEventListener('click', copyOnlineInvite);
+  document.getElementById('online-qr-download').addEventListener('click', downloadOnlineQr);
+  document.getElementById('online-qr-share').addEventListener('click', shareOnlineInvite);
+  document.getElementById('online-qr-close').addEventListener('click', closeOnlineQr);
+  document.getElementById('online-qr-overlay').addEventListener('click', (event) => {
+    if (event.target.id === 'online-qr-overlay') closeOnlineQr();
+  });
+  loadSolo();
+
+  // A guest whose welcome arrived before init rebuilt its view via the
+  // playerCount callback; if the messages raced the other way, apply the
+  // single-seat view now. One call covers both (no-op for hosts).
+  applyGuestSeatView();
+
+  if (window.mgbaTouch) {
+    window.mgbaTouch.init({
+      onInput: (p) => sendKeys(p),
+      onPause: () => { closeMenus(); togglePause(); },
+      onStatus: (text) => setStatus(text),
+    });
+  }
+
+  if (window.mgbaOnline) {
+    window.mgbaOnline.init({
+      status: (text) => { setOnlineStatus(text); setStatus(text); },
+      frame: onFrame,
+      videoStream: onGuestVideoStream,
+      audio: onAudio, // guests play the host's streamed mix (tagged rate + s16)
+      input: (player, keys) => setKeys(player + 1, keys),
+      guestSeat: (seat) => { if (window.mgbaTouch) window.mgbaTouch.setGuest(seat); },
+      // Touch-control invite: enable the on-screen pad, but keep the shared
+      // game canvas visible. Player 2 always receives the host's game view.
+      padGuest: (padOnly) => {
+        if (!padOnly || !window.mgbaTouch) return;
+        window.mgbaTouch.forceOn();
+      },
+      invites: (descriptors) => {
+        updateOnlineInvites(descriptors);
+        const button = document.getElementById('online-copy-invite');
+        if (button) button.dataset.invite = currentOnlineInvite || '';
+      },
+      inviteUsed: (player) => {
+        delete currentOnlineInvites[player];
+        const remaining = Object.keys(currentOnlineInvites).map(Number).sort((a, b) => a - b);
+        if (!remaining.includes(currentOnlineSlot)) currentOnlineSlot = remaining[0] || 1;
+        updateOnlineInvites(remaining.map((slot) => ({ player: slot, url: currentOnlineInvites[slot], consumed: false })));
+        const button = document.getElementById('online-copy-invite');
+        if (button) button.dataset.invite = currentOnlineInvite || '';
+        if (!remaining.length) closeOnlineQr();
+        setOnlineStatus(`Player ${player + 1} joined; ${remaining.length} guest invite${remaining.length === 1 ? '' : 's'} remaining.`);
+      },
+      playerCount: (count) => {
+        if (Number.isInteger(count) && count >= 1 && count <= 4 && count !== playerCount) {
+          playerCount = count;
+          initScreens(count);
+          highlightPlayersMenu(count);
+          // Guests are told "1 screen": rebuild as the single-seat view pinned
+          // to the seat the host assigned (welcome may have arrived already).
+          applyGuestSeatView();
+        }
+        return playerCount;
+      },
+    });
+  }
+
+  window.addEventListener('keydown', (e) => handleKey(e, true));
+  window.addEventListener('keyup', (e) => handleKey(e, false));
+  window.addEventListener('resize', () => layout());
+  document.addEventListener('fullscreenchange', () => {
+    refreshFullscreenFlag();
+    applyUiHidden();
+  });
+  document.addEventListener('webkitfullscreenchange', () => {
+    refreshFullscreenFlag();
+    applyUiHidden();
+  });
+
+  // Browsers require a user gesture before audio may start; unlock on any
+  // click or keypress so game sound starts the moment the user interacts.
+  window.addEventListener('pointerdown', unlockAudio);
+  window.addEventListener('keydown', unlockAudio);
+
+  // Gamepad polling runs on the animation frame; controller slot i -> player i+1.
+  pollGamepads();
+
+  // Desktop (Tauri) streams frames over the WebSocket backend; the browser
+  // build is always the in-browser WASM engine.
+  if (IS_TAURI) {
+    connectWebSocket();
+  } else if (wasmMode) {
+    wasmStartLoop();
+  }
+
+  // Deep link: ?rom=<url> boots straight into the game once the engine is up.
+  // Done last so every screen, control and menu is already wired.
+  if (!IS_TAURI) {
+    const romUrl = requestedRomUrl();
+    if (romUrl) {
+      if (wasmMode) await loadRomFromUrl(romUrl);
+      else setStatus('Cannot load ?rom: the in-browser engine failed to start');
+    }
+  }
+});

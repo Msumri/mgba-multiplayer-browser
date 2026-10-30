@@ -1,0 +1,102 @@
+# mgba-splitscreen
+
+A **split-screen GBA emulator** that runs 2–4 Game Boy Advance instances side by side
+and links them over a **virtual link cable**, so two to four players can trade,
+battle, or co-op in link-cable games (e.g. *The Legend of Zelda: Four Swords*) on a
+single machine — one ROM, one window, one keyboard/gamepads.
+
+mgba-splitscreen is **not** its own emulator core. It is a host application built on
+**[mGBA](https://mgba.io/)** (`mgba-emu/mgba`), using mGBA's `libmgba` and its
+lockstep multiplayer link implementation. All emulation and link-cable work is
+mGBA's; mgba-splitscreen adds the multi-instance orchestration, the synchronized frame
+streaming, input mapping, save management, and the UI.
+
+## Repo layout
+
+- `mgba-splitscreen/` — the application (a Tauri v2 app; the web version runs the same
+  frontend with the mGBA core compiled to WASM, fully in the browser).
+- Everything else — upstream mGBA source, compiled into `libmgba` by
+  `mgba-splitscreen/src-tauri/build.rs`.
+
+## How it works
+
+Each player gets their own mGBA `mCore` (GBA) instance. The instances are attached to
+one `GBASIOLockstepCoordinator` via `GBASIOLockstepDriver`s **before** the ROM boots,
+so link-cable games detect the cable at boot. Emulation runs every instance at ~60 FPS
+and the lockstep link keeps them in sync; video is streamed independently (default
+30 FPS) so lowering the video rate never slows the game or breaks the link.
+
+## Run it
+
+```bash
+cd mgba-splitscreen/src-tauri
+
+# Desktop app (a window on your display)
+cargo build --release
+./target/release/mgba-splitscreen
+```
+
+# Web version (no backend): serve mgba-splitscreen/src statically, with the WASM engine
+# staged in (web/build.sh does this):
+#   cp mgba-splitscreen/web/mgba-splitscreen-web.{js,wasm} mgba-splitscreen/src/
+#   python3 -m http.server 8090 -d mgba-splitscreen/src/   # open http://127.0.0.1:8090
+
+**Always use `--release`.** The emulation core is built `-O3` either way, but the Rust
+frame pipeline and UI glue are ~10x slower in a debug build (the debug desktop binary
+is ~223 MB vs ~11 MB release).
+
+Load a ROM with **File → Load ROM…** (desktop: native file dialog; browser: file
+picker; web ROM bytes are cached in IndexedDB so recents relaunch). `Test Roms/`
+(gitignored) holds the owner's legal ROMs for testing.
+
+## Controls
+
+| | Player 1 | Player 2 |
+|---|---|---|
+| D-pad | W A S D | Arrow keys |
+| A / B | K / J | M / N |
+| L / R | H / L | V / B |
+| Start / Select | Space / Backspace | Enter / O |
+
+The UI is mouse-driven (a top menu bar), so game keys never fight the UI. Players
+3–4 are keyboard/gamepad targets for the browser demo (see the backlog in
+`PROJECT_LOG.md`).
+
+## Saves
+
+- **Saves → Export/Import Save P*n*** — one instance's battery save as `.sav`
+  (mGBA-compatible). Import also takes RetroArch's `.srm` (byte-identical
+  data) without renaming. In the browser build the save moves through the
+  engine itself — no server involved — so it works on GitHub Pages.
+- **File → Export/Import All Saves…** — a single `.dualbysave` bundle of every
+  instance's save, so a party can be moved between machines.
+
+## Performance
+
+The link-critical constraint is **emulation speed**, and mGBA is fast: on this
+machine 4 synchronized instances of *Shining Soul II* (one of the heavier GBA games)
+emulate at ~4,000 FPS on one thread (0.24 ms/frame), so the 60 FPS target has huge
+headroom. The UI path is the real budget, so mgba-splitscreen:
+
+- streams frames as RGBA8888 and feeds them straight into `putImageData` (no
+  per-pixel decode in JS),
+- decouples video FPS from emulation (`--fps`, default 30),
+- is built with an optimized Rust release profile.
+
+`cargo run --release --bin bench -- <rom.gba> [players]` measures pure emulation
+speed in isolation.
+
+## Testing
+
+```bash
+cd mgba-splitscreen/src-tauri
+cargo test --release            # 128 unit + 2 smoke tests (needs Test Roms/)
+```
+
+See `mgba-splitscreen/TEST_INSTRUCTIONS.md` and `mgba-splitscreen/scripts/README.md` (headless
+gameplay drivers) for more.
+
+## Credits
+
+Emulation and link-cable multiplayer: **[mGBA](https://mgba.io/)** by endrift and
+contributors. mgba-splitscreen is a thin host around `libmgba` and would not exist without it.
