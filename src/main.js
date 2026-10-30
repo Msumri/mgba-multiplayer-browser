@@ -2612,6 +2612,13 @@ function highlightPlayersMenu(count) {
 }
 
 async function setPlayerCount(n) {
+  // The host's invite set and player-to-seat routing are fixed when hosting
+  // begins. Changing the emulator count mid-session would leave stale invites
+  // pointing at seats that may not exist, so require a fresh page/session.
+  if (window.mgbaOnline?.isHost?.()) {
+    setStatus('Online hosting is active. Reload the page to change the player count and start a new session.');
+    return;
+  }
   // Strict integer guard: NaN slips past the n<1/n>4 comparisons and would
   // corrupt playerCount (reached via a non-player button in #player-menu).
   if (!Number.isInteger(n) || n < 1 || n > 4) return;

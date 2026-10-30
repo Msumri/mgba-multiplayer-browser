@@ -135,6 +135,10 @@
   }
 
   function removeConnection(conn) {
+    // PeerJS can emit both close and error for one failed guest. Make cleanup
+    // idempotent so a seat is never re-issued twice.
+    if (conn.__removed) return;
+    conn.__removed = true;
     state.connections = state.connections.filter((item) => item !== conn);
     state.videoEncoders.delete(conn.__player);
     // Close the guest's dedicated media peer and stop its canvas capture.
@@ -146,6 +150,18 @@
     conn.__video = null;
     conn.__videoReady = false;
     conn.__nativeVideoReady = false;
+
+    // A disconnected guest frees its seat. Issue a fresh, single-use invite
+    // so the same player can reconnect without restarting the whole session.
+    if (state.role === 'host' && Number.isInteger(conn.__player)) {
+      const invite = state.invites.get(conn.__player);
+      if (invite) {
+        invite.token = randomToken();
+        invite.expires = Date.now() + 10 * 60 * 1000;
+        invite.consumed = false;
+        publishInvites();
+      }
+    }
   }
 
   // ---- Per-seat JPEG video encoding ----
@@ -303,8 +319,11 @@
     }
   }
 
+  // Number of linked emulator seats, including the host (Player 1).
+  // Online supports one host plus up to three remote guests.
   function guestCount() {
-    return state.callbacks.playerCount?.() || 2;
+    const count = Number(state.callbacks.playerCount?.() || 2);
+    return Number.isInteger(count) ? Math.max(1, Math.min(4, count)) : 2;
   }
 
   function inviteDescriptors() {
@@ -326,7 +345,13 @@
     if (message.type === 'hello') {
       const player = Number(message.player);
       const invite = state.invites.get(player);
+      const playerLimit = guestCount();
       const expired = !invite || Date.now() >= invite.expires;
+      if (!Number.isInteger(player) || player < 1 || player >= playerLimit) {
+        send(conn, { type: 'error', message: `Invalid player slot. This session supports Players 1-${playerLimit}.` });
+        conn.close();
+        return;
+      }
       // Each guest slot has its own high-entropy, time-limited capability.
       // Consuming P2's URL does not consume P3 or P4's URL.
       if (expired || invite.consumed || message.token !== invite.token) {
@@ -336,6 +361,11 @@
       }
       if (state.connections.some((item) => item.__player === player)) {
         send(conn, { type: 'error', message: `Player ${player + 1} is already connected` });
+        conn.close();
+        return;
+      }
+      if (state.connections.length >= playerLimit - 1) {
+        send(conn, { type: 'error', message: 'This four-player session is already full.' });
         conn.close();
         return;
       }
@@ -834,8 +864,11 @@
 
   function createInvites(padOnly) {
     state.invites = new Map();
+    const playerLimit = guestCount();
     const expires = Date.now() + 10 * 60 * 1000;
-    for (let player = 1; player < guestCount(); player++) {
+    // Player 1 is the host. Each remaining seat gets its own independent
+    // invite: Player 2, Player 3, and Player 4 when four seats are selected.
+    for (let player = 1; player < playerLimit; player++) {
       state.invites.set(player, { token: randomToken(), expires, consumed: false, pad: !!padOnly });
     }
   }
@@ -845,6 +878,15 @@
   // host wanting both kinds re-runs "Host as Controller Invites" after a
   // screen-invite set expires. Keeps the invite model dead simple.
   async function startHost(padOnly) {
+    const playerLimit = guestCount();
+    if (playerLimit < 2) {
+      report('Select 2, 3, or 4 Players in the Players menu before hosting. Player 1 is the host.');
+      return null;
+    }
+    if (playerLimit > 4) {
+      report('Online sessions support up to four players.');
+      return null;
+    }
     const needsFresh = state.role === 'host' && [...state.invites.values()].every((invite) =>
       invite.consumed || Date.now() >= invite.expires);
     if (state.role === 'host' && needsFresh) {
@@ -869,8 +911,8 @@
       state.peer.on('connection', setupHostConnection);
       publishInvites();
       report(padOnly
-        ? 'Host ready — guests get the game screen and touch controls'
-        : 'Online host ready — guests get the game screen and controls');
+        ? `Host ready — Player 1 host, ${playerLimit - 1} remote player slot${playerLimit === 2 ? '' : 's'}; game screen and touch controls enabled`
+        : `Online host ready — Player 1 host, invite Players 2-${playerLimit}`);
       return buildInvite(1);
     } catch (err) {
       state.role = 'idle';
